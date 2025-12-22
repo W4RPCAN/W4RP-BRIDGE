@@ -142,6 +142,55 @@ sealed class W4RPDebugData {
 }
 
 // =============================================================================
+// Connection State Machine
+// =============================================================================
+
+/**
+ * Represents the current state of the BLE connection.
+ *
+ * State transitions:
+ * - DISCONNECTED -> SCANNING (via scan())
+ * - SCANNING -> DISCONNECTED (scan complete/timeout)
+ * - DISCONNECTED -> CONNECTING (via connect())
+ * - CONNECTING -> DISCOVERING_SERVICES (GATT connected)
+ * - DISCOVERING_SERVICES -> READY (characteristics found)
+ * - READY -> DISCONNECTING (via disconnect())
+ * - DISCONNECTING -> DISCONNECTED (complete)
+ * - ANY -> ERROR (on failure)
+ */
+enum class W4RPConnectionState(val value: String) {
+    /** Not connected to any device */
+    DISCONNECTED("DISCONNECTED"),
+    
+    /** Scanning for nearby W4RP devices */
+    SCANNING("SCANNING"),
+    
+    /** Initiating GATT connection to a device */
+    CONNECTING("CONNECTING"),
+    
+    /** Connected, discovering services and characteristics */
+    DISCOVERING_SERVICES("DISCOVERING_SERVICES"),
+    
+    /** Fully connected and ready for operations */
+    READY("READY"),
+    
+    /** Disconnection in progress */
+    DISCONNECTING("DISCONNECTING"),
+    
+    /** An error occurred (check lastError for details) */
+    ERROR("ERROR");
+    
+    /** Convenience property for checking if ready for operations */
+    val isReady: Boolean get() = this == READY
+    
+    /** Convenience property for checking if any connection activity is in progress */
+    val isBusy: Boolean get() = when (this) {
+        SCANNING, CONNECTING, DISCOVERING_SERVICES, DISCONNECTING -> true
+        else -> false
+    }
+}
+
+// =============================================================================
 // Bridge
 // =============================================================================
 
@@ -177,14 +226,23 @@ class W4RPBridge(private val context: Context) {
     // State
     // -------------------------------------------------------------------------
     
-    private val _isConnected = MutableStateFlow(false)
-    val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
+    private val _connectionState = MutableStateFlow(W4RPConnectionState.DISCONNECTED)
+    /** Current connection state */
+    val connectionState: StateFlow<W4RPConnectionState> = _connectionState.asStateFlow()
     
-    private val _isScanning = MutableStateFlow(false)
-    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+    private val _lastError = MutableStateFlow<W4RPException?>(null)
+    /** Last error that occurred, cleared on successful operations */
+    val lastError: StateFlow<W4RPException?> = _lastError.asStateFlow()
     
     private val _discoveredDevices = MutableStateFlow<List<W4RPDevice>>(emptyList())
+    /** List of discovered devices during scanning */
     val discoveredDevices: StateFlow<List<W4RPDevice>> = _discoveredDevices.asStateFlow()
+    
+    /** Convenience property for backward compatibility */
+    val isConnected: Boolean get() = _connectionState.value == W4RPConnectionState.READY
+    
+    /** Convenience property for backward compatibility */
+    val isScanning: Boolean get() = _connectionState.value == W4RPConnectionState.SCANNING
     
     // -------------------------------------------------------------------------
     // Callbacks
@@ -241,7 +299,8 @@ class W4RPBridge(private val context: Context) {
         return suspendCancellableCoroutine { continuation ->
             scanContinuation = continuation
             
-            _isScanning.value = true
+            _connectionState.value = W4RPConnectionState.SCANNING
+            _lastError.value = null
             deviceMap.clear()
             _discoveredDevices.value = emptyList()
             
@@ -276,9 +335,13 @@ class W4RPBridge(private val context: Context) {
      */
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     suspend fun connect(device: W4RPDevice, timeoutMs: Long = 10000) {
-        if (_isConnected.value) {
+        if (_connectionState.value == W4RPConnectionState.READY) {
             throw W4RPException(W4RPErrorCode.ALREADY_CONNECTED, "Already connected")
         }
+        
+        stopScan()
+        _connectionState.value = W4RPConnectionState.CONNECTING
+        _lastError.value = null
         
         return suspendCancellableCoroutine { continuation ->
             connectContinuation = continuation
@@ -290,11 +353,12 @@ class W4RPBridge(private val context: Context) {
             }
             
             handler.postDelayed({
-                if (!_isConnected.value) {
+                if (_connectionState.value != W4RPConnectionState.READY) {
                     bluetoothGatt?.close()
-                    connectContinuation?.resumeWithException(
-                        W4RPException(W4RPErrorCode.CONNECTION_TIMEOUT, "Connection timed out")
-                    )
+                    _connectionState.value = W4RPConnectionState.ERROR
+                    val err = W4RPException(W4RPErrorCode.CONNECTION_TIMEOUT, "Connection timed out")
+                    _lastError.value = err
+                    connectContinuation?.resumeWithException(err)
                     connectContinuation = null
                 }
             }, timeoutMs)
@@ -313,6 +377,8 @@ class W4RPBridge(private val context: Context) {
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     suspend fun disconnect() {
         if (bluetoothGatt == null) return
+        
+        _connectionState.value = W4RPConnectionState.DISCONNECTING
         
         return suspendCancellableCoroutine { continuation ->
             disconnectContinuation = continuation
@@ -337,9 +403,14 @@ class W4RPBridge(private val context: Context) {
      *
      * @param json JSON string containing the ruleset
      * @param persistent If true, rules are saved to NVS (survive reboot)
+     * @param onProgress Optional callback reporting upload progress (bytesWritten, totalBytes)
      * @throws W4RPException if not connected or write fails
      */
-    suspend fun setRules(json: String, persistent: Boolean) {
+    suspend fun setRules(
+        json: String,
+        persistent: Boolean,
+        onProgress: ((bytesWritten: Int, totalBytes: Int) -> Unit)? = null
+    ) {
         ensureConnected()
         val gatt = bluetoothGatt ?: throw W4RPException(W4RPErrorCode.NOT_CONNECTED, "Not connected")
         val rx = rxCharacteristic ?: throw W4RPException(W4RPErrorCode.NOT_CONNECTED, "Not connected")
@@ -350,7 +421,7 @@ class W4RPBridge(private val context: Context) {
         val header = "SET:RULES:$mode:${data.size}:$crc"
         
         writeData(gatt, rx, header.toByteArray(Charsets.UTF_8))
-        sendChunked(gatt, rx, data)
+        sendChunked(gatt, rx, data, onProgress = onProgress)
         writeData(gatt, rx, "END".toByteArray(Charsets.UTF_8))
     }
     
@@ -358,9 +429,13 @@ class W4RPBridge(private val context: Context) {
      * Start a Delta OTA firmware update.
      *
      * @param patchData Binary patch data (Janpatch format)
+     * @param onProgress Optional callback reporting upload progress (bytesWritten, totalBytes)
      * @throws W4RPException if not connected or OTA fails
      */
-    suspend fun startOTA(patchData: ByteArray) {
+    suspend fun startOTA(
+        patchData: ByteArray,
+        onProgress: ((bytesWritten: Int, totalBytes: Int) -> Unit)? = null
+    ) {
         ensureConnected()
         val gatt = bluetoothGatt ?: throw W4RPException(W4RPErrorCode.NOT_CONNECTED, "Not connected")
         val rx = rxCharacteristic ?: throw W4RPException(W4RPErrorCode.NOT_CONNECTED, "Not connected")
@@ -370,7 +445,7 @@ class W4RPBridge(private val context: Context) {
         
         writeData(gatt, rx, cmd.toByteArray(Charsets.UTF_8))
         delay(200)
-        sendChunked(gatt, rx, patchData)
+        sendChunked(gatt, rx, patchData, onProgress = onProgress)
         writeData(gatt, rx, "END".toByteArray(Charsets.UTF_8))
     }
     
@@ -425,10 +500,15 @@ class W4RPBridge(private val context: Context) {
         }
     }
     
-    fun setRulesWithCallback(json: String, persistent: Boolean, completion: (Result<Unit>) -> Unit) {
+    fun setRulesWithCallback(
+        json: String,
+        persistent: Boolean,
+        onProgress: ((bytesWritten: Int, totalBytes: Int) -> Unit)? = null,
+        completion: (Result<Unit>) -> Unit
+    ) {
         scope.launch {
             try {
-                setRules(json, persistent)
+                setRules(json, persistent, onProgress)
                 completion(Result.success(Unit))
             } catch (e: W4RPException) {
                 completion(Result.failure(e))
@@ -436,10 +516,14 @@ class W4RPBridge(private val context: Context) {
         }
     }
     
-    fun startOTAWithCallback(patchData: ByteArray, completion: (Result<Unit>) -> Unit) {
+    fun startOTAWithCallback(
+        patchData: ByteArray,
+        onProgress: ((bytesWritten: Int, totalBytes: Int) -> Unit)? = null,
+        completion: (Result<Unit>) -> Unit
+    ) {
         scope.launch {
             try {
-                startOTA(patchData)
+                startOTA(patchData, onProgress)
                 completion(Result.success(Unit))
             } catch (e: W4RPException) {
                 completion(Result.failure(e))
@@ -453,7 +537,9 @@ class W4RPBridge(private val context: Context) {
     
     @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun stopScan() {
-        _isScanning.value = false
+        if (_connectionState.value == W4RPConnectionState.SCANNING) {
+            _connectionState.value = W4RPConnectionState.DISCONNECTED
+        }
         try {
             scanner?.stopScan(scanCallback)
         } catch (_: SecurityException) {}
@@ -499,7 +585,14 @@ class W4RPBridge(private val context: Context) {
         delay(10)
     }
     
-    private suspend fun sendChunked(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, data: ByteArray, chunkSize: Int = 180) {
+    private suspend fun sendChunked(
+        gatt: BluetoothGatt,
+        char: BluetoothGattCharacteristic,
+        data: ByteArray,
+        chunkSize: Int = 180,
+        onProgress: ((bytesWritten: Int, totalBytes: Int) -> Unit)? = null
+    ) {
+        val totalBytes = data.size
         var offset = 0
         while (offset < data.size) {
             val end = minOf(offset + chunkSize, data.size)
@@ -507,6 +600,7 @@ class W4RPBridge(private val context: Context) {
             writeData(gatt, char, chunk)
             delay(3)
             offset = end
+            onProgress?.invoke(offset, totalBytes)
         }
     }
     
@@ -632,10 +726,11 @@ class W4RPBridge(private val context: Context) {
             handler.post {
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
+                        _connectionState.value = W4RPConnectionState.DISCOVERING_SERVICES
                         gatt.discoverServices()
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
-                        _isConnected.value = false
+                        _connectionState.value = W4RPConnectionState.DISCONNECTED
                         rxCharacteristic = null
                         txCharacteristic = null
                         statusCharacteristic = null
@@ -653,18 +748,20 @@ class W4RPBridge(private val context: Context) {
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             handler.post {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    connectContinuation?.resumeWithException(
-                        W4RPException(W4RPErrorCode.SERVICE_NOT_FOUND, "Service discovery failed")
-                    )
+                    _connectionState.value = W4RPConnectionState.ERROR
+                    val err = W4RPException(W4RPErrorCode.SERVICE_NOT_FOUND, "Service discovery failed")
+                    _lastError.value = err
+                    connectContinuation?.resumeWithException(err)
                     connectContinuation = null
                     return@post
                 }
                 
                 val service = gatt.getService(W4RPUUIDs.SERVICE)
                 if (service == null) {
-                    connectContinuation?.resumeWithException(
-                        W4RPException(W4RPErrorCode.SERVICE_NOT_FOUND, "W4RP service not found")
-                    )
+                    _connectionState.value = W4RPConnectionState.ERROR
+                    val err = W4RPException(W4RPErrorCode.SERVICE_NOT_FOUND, "W4RP service not found")
+                    _lastError.value = err
+                    connectContinuation?.resumeWithException(err)
                     connectContinuation = null
                     return@post
                 }
@@ -677,13 +774,15 @@ class W4RPBridge(private val context: Context) {
                 statusCharacteristic?.let { enableNotifications(gatt, it) }
                 
                 if (rxCharacteristic != null && txCharacteristic != null && statusCharacteristic != null) {
-                    _isConnected.value = true
+                    _connectionState.value = W4RPConnectionState.READY
+                    _lastError.value = null
                     connectContinuation?.resume(Unit)
                     connectContinuation = null
                 } else {
-                    connectContinuation?.resumeWithException(
-                        W4RPException(W4RPErrorCode.CHARACTERISTIC_NOT_FOUND, "Characteristics not found")
-                    )
+                    _connectionState.value = W4RPConnectionState.ERROR
+                    val err = W4RPException(W4RPErrorCode.CHARACTERISTIC_NOT_FOUND, "Characteristics not found")
+                    _lastError.value = err
+                    connectContinuation?.resumeWithException(err)
                     connectContinuation = null
                 }
             }

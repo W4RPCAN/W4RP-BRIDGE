@@ -1,12 +1,12 @@
 /**
  * W4RPBridge.ts
  * 
- * W4RP BLE Bridge - Web Bluetooth API Implementation
+ * W4RP Bridge - Web Bluetooth API Implementation
  * Official client library for connecting to W4RPBLE firmware modules.
  * 
  * @license MIT
  * @copyright 2024 W4RP Automotive
- * @version 1.0.0
+ * @version 1.1.0
  * 
  * Compatible with:
  * - Chrome 56+ (Desktop & Android)
@@ -17,7 +17,7 @@
  * - Firefox (Web Bluetooth not implemented)
  * - Safari / iOS (Web Bluetooth not implemented)
  * 
- * @see https://github.com/user/w4rpble for firmware source
+ * @see https://github.com/W4RPCAN/W4RPBLE for firmware source
  * @see https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API
  */
 
@@ -253,6 +253,48 @@ export interface W4RPBridgeCallbacks {
     onDisconnect?: () => void;
 }
 
+/**
+ * Progress callback for upload operations.
+ * @param bytesWritten - Bytes written so far
+ * @param totalBytes - Total bytes to write
+ */
+export type W4RPProgressCallback = (bytesWritten: number, totalBytes: number) => void;
+
+// =============================================================================
+// Connection State Machine
+// =============================================================================
+
+/**
+ * Represents the current state of the BLE connection.
+ *
+ * State transitions:
+ * - DISCONNECTED -> CONNECTING (via connect())
+ * - CONNECTING -> DISCOVERING_SERVICES (GATT connected)
+ * - DISCOVERING_SERVICES -> READY (characteristics found)
+ * - READY -> DISCONNECTING (via disconnect())
+ * - DISCONNECTING -> DISCONNECTED (complete)
+ * - ANY -> ERROR (on failure)
+ */
+export enum W4RPConnectionState {
+    /** Not connected to any device */
+    DISCONNECTED = 'DISCONNECTED',
+
+    /** Initiating GATT connection to a device */
+    CONNECTING = 'CONNECTING',
+
+    /** Connected, discovering services and characteristics */
+    DISCOVERING_SERVICES = 'DISCOVERING_SERVICES',
+
+    /** Fully connected and ready for operations */
+    READY = 'READY',
+
+    /** Disconnection in progress */
+    DISCONNECTING = 'DISCONNECTING',
+
+    /** An error occurred (check lastError for details) */
+    ERROR = 'ERROR',
+}
+
 // =============================================================================
 // Main Bridge Class
 // =============================================================================
@@ -281,6 +323,10 @@ export class W4RPBridge {
     private txCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
     private statusCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
 
+    // Connection State
+    private _connectionState: W4RPConnectionState = W4RPConnectionState.DISCONNECTED;
+    private _lastError: W4RPError | null = null;
+
     // Stream State (for receiving large payloads)
     private streamActive = false;
     private streamBuffer: Uint8Array = new Uint8Array(0);
@@ -297,9 +343,19 @@ export class W4RPBridge {
     // Public Getters
     // ---------------------------------------------------------------------------
 
-    /** Whether the bridge is currently connected to a device */
+    /** Current connection state */
+    get connectionState(): W4RPConnectionState {
+        return this._connectionState;
+    }
+
+    /** Last error that occurred, cleared on successful operations */
+    get lastError(): W4RPError | null {
+        return this._lastError;
+    }
+
+    /** Whether the bridge is currently connected (convenience property) */
     get isConnected(): boolean {
-        return this.server?.connected ?? false;
+        return this._connectionState === W4RPConnectionState.READY;
     }
 
     /** Name of the connected device, or null if not connected */
@@ -348,9 +404,12 @@ export class W4RPBridge {
             );
         }
 
-        if (this.isConnected) {
+        if (this._connectionState === W4RPConnectionState.READY) {
             throw new W4RPError(W4RPErrorCode.ALREADY_CONNECTED, 'Already connected to a device');
         }
+
+        this._connectionState = W4RPConnectionState.CONNECTING;
+        this._lastError = null;
 
         try {
             // Request device - shows browser's device picker
@@ -372,6 +431,8 @@ export class W4RPBridge {
             if (!this.server) {
                 throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Failed to connect to GATT server');
             }
+
+            this._connectionState = W4RPConnectionState.DISCOVERING_SERVICES;
 
             // Discover service
             const service = await this.server.getPrimaryService(W4RP_UUIDS.SERVICE);
@@ -400,15 +461,27 @@ export class W4RPBridge {
                 }
             });
 
+            this._connectionState = W4RPConnectionState.READY;
+            this._lastError = null;
+
         } catch (error) {
-            if (error instanceof W4RPError) throw error;
+            this._connectionState = W4RPConnectionState.ERROR;
+
+            if (error instanceof W4RPError) {
+                this._lastError = error;
+                throw error;
+            }
 
             // Handle browser-specific errors
             const message = error instanceof Error ? error.message : String(error);
             if (message.includes('User cancelled')) {
-                throw new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'Device selection was cancelled');
+                const err = new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'Device selection was cancelled');
+                this._lastError = err;
+                throw err;
             }
-            throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, `Connection failed: ${message}`);
+            const err = new W4RPError(W4RPErrorCode.CONNECTION_FAILED, `Connection failed: ${message}`);
+            this._lastError = err;
+            throw err;
         }
     }
 
@@ -416,6 +489,7 @@ export class W4RPBridge {
      * Disconnect from the currently connected device.
      */
     disconnect(): void {
+        this._connectionState = W4RPConnectionState.DISCONNECTING;
         this.server?.disconnect();
         this.handleDisconnect();
     }
@@ -445,9 +519,14 @@ export class W4RPBridge {
      * 
      * @param json - JSON string containing the ruleset
      * @param persistent - If true, rules are saved to NVS (survive reboot)
+     * @param onProgress - Optional callback reporting upload progress
      * @throws {W4RPError} If not connected or write fails
      */
-    async setRules(json: string, persistent: boolean): Promise<void> {
+    async setRules(
+        json: string,
+        persistent: boolean,
+        onProgress?: W4RPProgressCallback
+    ): Promise<void> {
         this.ensureConnected();
 
         const data = new TextEncoder().encode(json);
@@ -456,7 +535,7 @@ export class W4RPBridge {
         const header = `SET:RULES:${mode}:${data.length}:${crc}`;
 
         await this.write(new TextEncoder().encode(header));
-        await this.sendChunked(data);
+        await this.sendChunked(data, 180, onProgress);
         await this.write(new TextEncoder().encode('END'));
     }
 
@@ -464,9 +543,13 @@ export class W4RPBridge {
      * Start a Delta OTA firmware update.
      * 
      * @param patchData - Binary patch data (Janpatch format)
+     * @param onProgress - Optional callback reporting upload progress
      * @throws {W4RPError} If not connected or OTA fails
      */
-    async startOTA(patchData: Uint8Array): Promise<void> {
+    async startOTA(
+        patchData: Uint8Array,
+        onProgress?: W4RPProgressCallback
+    ): Promise<void> {
         this.ensureConnected();
 
         const crc = this.crc32(patchData);
@@ -474,7 +557,7 @@ export class W4RPBridge {
 
         await this.write(new TextEncoder().encode(cmd));
         await this.delay(200); // Allow ESP32 to prepare
-        await this.sendChunked(patchData);
+        await this.sendChunked(patchData, 180, onProgress);
         await this.write(new TextEncoder().encode('END'));
     }
 
@@ -510,7 +593,12 @@ export class W4RPBridge {
     }
 
     /** Send data in 180-byte chunks with throttling */
-    private async sendChunked(data: Uint8Array, chunkSize: number = 180): Promise<void> {
+    private async sendChunked(
+        data: Uint8Array,
+        chunkSize: number = 180,
+        onProgress?: W4RPProgressCallback
+    ): Promise<void> {
+        const totalBytes = data.length;
         let offset = 0;
         while (offset < data.length) {
             const end = Math.min(offset + chunkSize, data.length);
@@ -518,6 +606,7 @@ export class W4RPBridge {
             await this.write(chunk);
             await this.delay(3); // Prevent BLE congestion
             offset = end;
+            onProgress?.(offset, totalBytes);
         }
     }
 
@@ -652,6 +741,7 @@ export class W4RPBridge {
 
     /** Handle disconnection */
     private handleDisconnect(): void {
+        this._connectionState = W4RPConnectionState.DISCONNECTED;
         this.device = null;
         this.server = null;
         this.rxCharacteristic = null;

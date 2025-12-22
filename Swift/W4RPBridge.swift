@@ -159,6 +159,60 @@ public struct W4RPDebugData: Sendable {
     }
 }
 
+// MARK: - Connection State Machine
+
+/**
+ * Represents the current state of the BLE connection.
+ *
+ * State transitions:
+ * ```
+ * DISCONNECTED -> SCANNING (via scan())
+ * SCANNING -> DISCONNECTED (scan complete/timeout)
+ * DISCONNECTED -> CONNECTING (via connect())
+ * CONNECTING -> DISCOVERING_SERVICES (GATT connected)
+ * DISCOVERING_SERVICES -> READY (characteristics found)
+ * READY -> DISCONNECTING (via disconnect())
+ * DISCONNECTING -> DISCONNECTED (complete)
+ * ANY -> ERROR (on failure)
+ * ERROR -> DISCONNECTED (reset)
+ * ```
+ */
+public enum W4RPConnectionState: String, Sendable {
+    /// Not connected to any device
+    case disconnected = "DISCONNECTED"
+    
+    /// Scanning for nearby W4RP devices
+    case scanning = "SCANNING"
+    
+    /// Initiating GATT connection to a device
+    case connecting = "CONNECTING"
+    
+    /// Connected, discovering services and characteristics
+    case discoveringServices = "DISCOVERING_SERVICES"
+    
+    /// Fully connected and ready for operations
+    case ready = "READY"
+    
+    /// Disconnection in progress
+    case disconnecting = "DISCONNECTING"
+    
+    /// An error occurred (check lastError for details)
+    case error = "ERROR"
+    
+    /// Convenience property for checking if ready for operations
+    public var isReady: Bool { self == .ready }
+    
+    /// Convenience property for checking if any connection activity is in progress
+    public var isBusy: Bool {
+        switch self {
+        case .scanning, .connecting, .discoveringServices, .disconnecting:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 // MARK: - Bridge
 
 /**
@@ -195,10 +249,23 @@ public final class W4RPBridge: NSObject, ObservableObject {
     
     // MARK: - Published State
     
-    @Published public private(set) var isConnected = false
-    @Published public private(set) var isScanning = false
+    /// Current connection state (replaces deprecated isConnected)
+    @Published public private(set) var connectionState: W4RPConnectionState = .disconnected
+    
+    /// List of discovered devices during scanning
     @Published public private(set) var discoveredDevices: [W4RPDevice] = []
+    
+    /// Name of the connected device, or nil if not connected
     @Published public private(set) var connectedDeviceName: String?
+    
+    /// Last error that occurred, cleared on successful operations
+    @Published public private(set) var lastError: W4RPError?
+    
+    /// Convenience computed property for backward compatibility
+    public var isConnected: Bool { connectionState == .ready }
+    
+    /// Convenience computed property for backward compatibility
+    public var isScanning: Bool { connectionState == .scanning }
     
     // MARK: - Configuration
     
@@ -206,7 +273,9 @@ public final class W4RPBridge: NSObject, ObservableObject {
     
     // MARK: - Callbacks
     
+    /// Called when module sends a status update
     public var onStatusUpdate: ((String) -> Void)?
+    /// Called when debug data is received
     public var onDebugData: ((W4RPDebugData) -> Void)?
     
     // MARK: - Private State
@@ -256,7 +325,8 @@ public final class W4RPBridge: NSObject, ObservableObject {
         return try await withCheckedThrowingContinuation { continuation in
             scanContinuation = continuation
             
-            isScanning = true
+            connectionState = .scanning
+            lastError = nil
             deviceMap.removeAll()
             discoveredDevices = []
             
@@ -279,11 +349,13 @@ public final class W4RPBridge: NSObject, ObservableObject {
      * - Throws: `W4RPError` if connection fails or times out
      */
     public func connect(to device: W4RPDevice, timeout: TimeInterval = 10.0) async throws {
-        guard !isConnected else {
+        guard connectionState != .ready else {
             throw W4RPError(.alreadyConnected, "Already connected to a device")
         }
         
         stopScan()
+        connectionState = .connecting
+        lastError = nil
         
         return try await withCheckedThrowingContinuation { continuation in
             connectContinuation = continuation
@@ -292,8 +364,10 @@ public final class W4RPBridge: NSObject, ObservableObject {
             device.peripheral.delegate = self
             
             connectionTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-                guard let self = self, !self.isConnected else { return }
+                guard let self = self, self.connectionState != .ready else { return }
                 self.central.cancelPeripheralConnection(device.peripheral)
+                self.connectionState = .error
+                self.lastError = W4RPError(.connectionTimeout, "Connection timed out")
                 self.connectContinuation?.resume(throwing: W4RPError(.connectionTimeout, "Connection timed out"))
                 self.connectContinuation = nil
             }
@@ -309,6 +383,8 @@ public final class W4RPBridge: NSObject, ObservableObject {
      */
     public func disconnect() async throws {
         guard let p = peripheral else { return }
+        
+        connectionState = .disconnecting
         
         return try await withCheckedThrowingContinuation { continuation in
             disconnectContinuation = continuation
@@ -339,9 +415,14 @@ public final class W4RPBridge: NSObject, ObservableObject {
      *
      * - Parameter json: JSON string containing the ruleset
      * - Parameter persistent: If true, rules are saved to NVS (survive reboot)
+     * - Parameter onProgress: Optional callback reporting upload progress (bytesWritten, totalBytes)
      * - Throws: `W4RPError` if not connected or write fails
      */
-    public func setRules(json: String, persistent: Bool) async throws {
+    public func setRules(
+        json: String,
+        persistent: Bool,
+        onProgress: ((Int, Int) -> Void)? = nil
+    ) async throws {
         try ensureConnected()
         guard let p = peripheral, let rx = rxChar else {
             throw W4RPError(.notConnected, "Not connected")
@@ -356,7 +437,7 @@ public final class W4RPBridge: NSObject, ObservableObject {
         let header = "SET:RULES:\(mode):\(data.count):\(crc)"
         
         try await writeData(header.data(using: .utf8)!, to: p, char: rx)
-        try await sendChunked(data: data, to: p, char: rx)
+        try await sendChunked(data: data, to: p, char: rx, onProgress: onProgress)
         try await writeData("END".data(using: .utf8)!, to: p, char: rx)
     }
     
@@ -364,9 +445,13 @@ public final class W4RPBridge: NSObject, ObservableObject {
      * Start a Delta OTA firmware update.
      *
      * - Parameter patchData: Binary patch data (Janpatch format)
+     * - Parameter onProgress: Optional callback reporting upload progress (bytesWritten, totalBytes)
      * - Throws: `W4RPError` if not connected or OTA fails
      */
-    public func startOTA(patchData: Data) async throws {
+    public func startOTA(
+        patchData: Data,
+        onProgress: ((Int, Int) -> Void)? = nil
+    ) async throws {
         try ensureConnected()
         guard let p = peripheral, let rx = rxChar else {
             throw W4RPError(.notConnected, "Not connected")
@@ -377,7 +462,7 @@ public final class W4RPBridge: NSObject, ObservableObject {
         
         try await writeData(cmd.data(using: .utf8)!, to: p, char: rx)
         try await Task.sleep(nanoseconds: 200_000_000)
-        try await sendChunked(data: patchData, to: p, char: rx)
+        try await sendChunked(data: patchData, to: p, char: rx, onProgress: onProgress)
         try await writeData("END".data(using: .utf8)!, to: p, char: rx)
     }
     
@@ -435,10 +520,15 @@ public final class W4RPBridge: NSObject, ObservableObject {
         }
     }
     
-    public func setRules(json: String, persistent: Bool, completion: @escaping (Result<Void, W4RPError>) -> Void) {
+    public func setRules(
+        json: String,
+        persistent: Bool,
+        onProgress: ((Int, Int) -> Void)? = nil,
+        completion: @escaping (Result<Void, W4RPError>) -> Void
+    ) {
         Task {
             do {
-                try await setRules(json: json, persistent: persistent)
+                try await setRules(json: json, persistent: persistent, onProgress: onProgress)
                 completion(.success(()))
             } catch let error as W4RPError {
                 completion(.failure(error))
@@ -448,10 +538,14 @@ public final class W4RPBridge: NSObject, ObservableObject {
         }
     }
     
-    public func startOTA(patchData: Data, completion: @escaping (Result<Void, W4RPError>) -> Void) {
+    public func startOTA(
+        patchData: Data,
+        onProgress: ((Int, Int) -> Void)? = nil,
+        completion: @escaping (Result<Void, W4RPError>) -> Void
+    ) {
         Task {
             do {
-                try await startOTA(patchData: patchData)
+                try await startOTA(patchData: patchData, onProgress: onProgress)
                 completion(.success(()))
             } catch let error as W4RPError {
                 completion(.failure(error))
@@ -464,7 +558,9 @@ public final class W4RPBridge: NSObject, ObservableObject {
     // MARK: - Public Utilities
     
     public func stopScan() {
-        isScanning = false
+        if connectionState == .scanning {
+            connectionState = .disconnected
+        }
         central.stopScan()
         scanTimer?.invalidate()
         scanTimer = nil
@@ -507,7 +603,14 @@ public final class W4RPBridge: NSObject, ObservableObject {
         peripheral.writeValue(data, for: char, type: .withResponse)
     }
     
-    private func sendChunked(data: Data, to peripheral: CBPeripheral, char: CBCharacteristic, chunkSize: Int = 180) async throws {
+    private func sendChunked(
+        data: Data,
+        to peripheral: CBPeripheral,
+        char: CBCharacteristic,
+        chunkSize: Int = 180,
+        onProgress: ((Int, Int) -> Void)? = nil
+    ) async throws {
+        let totalBytes = data.count
         var offset = 0
         while offset < data.count {
             let end = min(offset + chunkSize, data.count)
@@ -515,6 +618,7 @@ public final class W4RPBridge: NSObject, ObservableObject {
             peripheral.writeValue(chunk, for: char, type: .withResponse)
             try await Task.sleep(nanoseconds: 3_000_000)
             offset = end
+            onProgress?(offset, totalBytes)
         }
     }
     
@@ -655,21 +759,26 @@ extension W4RPBridge: CBCentralManagerDelegate {
     
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectionTimer?.invalidate()
+        connectionState = .discoveringServices
         peripheral.discoverServices([uuids.service])
     }
     
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         connectionTimer?.invalidate()
-        connectContinuation?.resume(throwing: W4RPError(.connectionFailed, error?.localizedDescription ?? "Connection failed"))
+        connectionState = .error
+        let err = W4RPError(.connectionFailed, error?.localizedDescription ?? "Connection failed")
+        lastError = err
+        connectContinuation?.resume(throwing: err)
         connectContinuation = nil
     }
     
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        isConnected = false
+        connectionState = .disconnected
         rxChar = nil
         txChar = nil
         statusChar = nil
         self.peripheral = nil
+        connectedDeviceName = nil
         
         disconnectContinuation?.resume()
         disconnectContinuation = nil
@@ -694,11 +803,15 @@ extension W4RPBridge: CBPeripheralDelegate {
         }
         
         if rxChar != nil && txChar != nil && statusChar != nil {
-            isConnected = true
+            connectionState = .ready
+            lastError = nil
             connectContinuation?.resume()
             connectContinuation = nil
         } else {
-            connectContinuation?.resume(throwing: W4RPError(.characteristicNotFound, "Missing characteristics"))
+            connectionState = .error
+            let err = W4RPError(.characteristicNotFound, "Missing characteristics")
+            lastError = err
+            connectContinuation?.resume(throwing: err)
             connectContinuation = nil
         }
     }
