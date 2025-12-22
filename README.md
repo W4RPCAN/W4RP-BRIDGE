@@ -5,7 +5,11 @@
 
 **Official client libraries for W4RPBLE firmware modules.**
 
-This directory contains production-ready implementations for connecting to W4RPBLE automotive IoT modules from different platforms.
+These client libraries are designed to communicate with devices running the [W4RP-BLE firmware library](https://github.com/W4RPCAN/W4RP-BLE). The firmware is **required** and must be installed on your ESP32-based W4RP-compatible device for these clients to function.
+
+**Website:** [https://w4rp.dev](https://w4rp.dev)
+
+**ESP32 Firmware Library:** [https://github.com/W4RPCAN/W4RP-BLE](https://github.com/W4RPCAN/W4RP-BLE)
 
 ## Implementations
 
@@ -239,7 +243,7 @@ async function connect() {
 
 ## Roadmap
 
-Future improvements planned for W4RP-BRIDGE:
+Future improvements planned:
 
 - [x] **Async/Await API** - Native async/await patterns (Swift 5.5+ `async throws`, Kotlin Coroutines `suspend`, TypeScript `async`). Legacy callback APIs maintained for backward compatibility.
 - [x] **OTA Progress Callbacks** - All implementations now support `onProgress(bytesWritten, totalBytes)` callback for firmware updates and rule uploads. Callback is optional.
