@@ -1,7 +1,7 @@
 # W4RP-BRIDGE
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)]()
 
 **Official client libraries for W4RPBLE firmware modules.**
 
@@ -11,7 +11,7 @@ This directory contains production-ready implementations for connecting to W4RPB
 
 | Platform | File | Runtime |
 |---|---|---|
-| **iOS / macOS** | [`Swift/W4RPBridge.swift`](Swift/W4RPBridge.swift) | iOS 14+, macOS 11+ |
+| **iOS / macOS** | [`Swift/W4RPBridge.swift`](Swift/W4RPBridge.swift) | iOS 15+, macOS 12+ (async/await) |
 | **Android** | [`Kotlin/W4RPBridge.kt`](Kotlin/W4RPBridge.kt) | API 21+ (Lollipop) |
 | **Web** | [`WebBluetooth/W4RPBridge.ts`](WebBluetooth/W4RPBridge.ts) | Chrome 56+, Edge 79+ |
 
@@ -173,60 +173,44 @@ All implementations use standardized error codes organized by category:
 
 ## Usage Examples
 
-### Swift (iOS)
+### Swift (iOS) - Async/Await
 
 ```swift
 import W4RPBridge
 
 let bridge = W4RPBridge()
 
-bridge.startScan { result in
-    switch result {
-    case .success(let devices):
+Task {
+    do {
+        let devices = try await bridge.scan()
         guard let device = devices.first else { return }
-        
-        bridge.connect(to: device) { result in
-            if case .success = result {
-                bridge.getProfile { result in
-                    if case .success(let profile) = result {
-                        print("Module: \(profile.module.id)")
-                    }
-                }
-            }
-        }
-    case .failure(let error):
+        try await bridge.connect(to: device)
+        let profile = try await bridge.getProfile()
+        print("Module: \(profile.module.id)")
+    } catch let error as W4RPError {
         print("Error \(error.code.rawValue): \(error.message)")
     }
 }
 ```
 
-### Kotlin (Android)
+### Kotlin (Android) - Suspend Functions
 
 ```kotlin
 import com.w4rp.bridge.W4RPBridge
+import kotlinx.coroutines.launch
 
 val bridge = W4RPBridge(context)
 
-bridge.startScan { result ->
-    result.fold(
-        onSuccess = { devices ->
-            val device = devices.firstOrNull() ?: return@fold
-            
-            bridge.connect(device) { connectResult ->
-                connectResult.onSuccess {
-                    bridge.getProfile { profileResult ->
-                        profileResult.onSuccess { json ->
-                            Log.d("W4RP", "Profile: $json")
-                        }
-                    }
-                }
-            }
-        },
-        onFailure = { error ->
-            val w4rpError = error as? W4RPException ?: return@fold
-            Log.e("W4RP", "Error ${w4rpError.errorCode.code}: ${w4rpError.message}")
-        }
-    )
+lifecycleScope.launch {
+    try {
+        val devices = bridge.scan()
+        val device = devices.firstOrNull() ?: return@launch
+        bridge.connect(device)
+        val profile = bridge.getProfile()
+        Log.d("W4RP", "Profile: $profile")
+    } catch (e: W4RPException) {
+        Log.e("W4RP", "Error ${e.errorCode.code}: ${e.message}")
+    }
 }
 ```
 
@@ -250,6 +234,21 @@ async function connect() {
     }
 }
 ```
+
+---
+
+## Roadmap
+
+Future improvements planned for W4RP-BRIDGE:
+
+- [x] **Async/Await API** - Native async/await patterns (Swift 5.5+ `async throws`, Kotlin Coroutines `suspend`, TypeScript `async`). Legacy callback APIs maintained for backward compatibility.
+- [ ] **OTA Progress Callbacks** - Add `onProgress(bytesWritten, totalBytes)` callback for firmware updates and large rule uploads
+- [ ] **Connection State Machine** - Replace boolean `isConnected` with proper state enum (`DISCONNECTED`, `SCANNING`, `CONNECTING`, `DISCOVERING_SERVICES`, `READY`, `DISCONNECTING`, `ERROR`)
+- [ ] **Retry with Exponential Backoff** - Built-in retry logic for flaky BLE connections (configurable max retries, 1s → 2s → 4s delays)
+- [ ] **Automatic Reconnection** - Optional auto-reconnect when connection is lost unexpectedly
+- [ ] **Package Distribution** - Publish to Swift Package Manager (SPM), Maven Central / JitPack, and npm
+
+Contributions welcome! See individual implementation files for platform-specific notes.
 
 ---
 
