@@ -191,6 +191,86 @@ enum class W4RPConnectionState(val value: String) {
 }
 
 // =============================================================================
+// Retry Configuration
+// =============================================================================
+
+/**
+ * Configuration for exponential backoff retry logic.
+ *
+ * Example usage:
+ * ```kotlin
+ * val config = W4RPRetryConfig(maxRetries = 3, baseDelayMs = 1000)
+ * bridge.connectWithRetry(device, retryConfig = config)
+ * ```
+ *
+ * @property maxRetries Maximum number of retry attempts (0 = no retries, just the initial attempt)
+ * @property baseDelayMs Base delay in milliseconds before first retry (default: 1000)
+ * @property maxDelayMs Maximum delay cap in milliseconds (default: 16000)
+ * @property multiplier Multiplier for exponential growth (default: 2.0)
+ */
+data class W4RPRetryConfig(
+    val maxRetries: Int = 3,
+    val baseDelayMs: Long = 1000L,
+    val maxDelayMs: Long = 16000L,
+    val multiplier: Double = 2.0
+) {
+    companion object {
+        /** Default configuration: 3 retries, 1s base, 16s max, 2x multiplier */
+        val DEFAULT = W4RPRetryConfig()
+    }
+    
+    /**
+     * Calculate delay for a given attempt (0-indexed).
+     * @param attempt The attempt number (0-indexed)
+     * @return Delay in milliseconds
+     */
+    fun delayForAttempt(attempt: Int): Long {
+        val delay = (baseDelayMs * kotlin.math.pow(multiplier, attempt.toDouble())).toLong()
+        return minOf(delay, maxDelayMs)
+    }
+}
+
+// =============================================================================
+// Auto-Reconnect Configuration
+// =============================================================================
+
+/**
+ * Configuration for automatic reconnection when connection is lost unexpectedly.
+ *
+ * When enabled, the bridge will attempt to reconnect automatically if the connection
+ * is lost (e.g., device goes out of range, power loss). The reconnection uses
+ * exponential backoff as configured in `retryConfig`.
+ *
+ * Example usage:
+ * ```kotlin
+ * bridge.autoReconnectConfig = W4RPAutoReconnectConfig(enabled = true)
+ * bridge.onReconnecting = { attempt -> Log.d("W4RP", "Reconnecting attempt $attempt...") }
+ * bridge.onReconnected = { Log.d("W4RP", "Reconnected!") }
+ * bridge.onReconnectFailed = { error -> Log.e("W4RP", "Failed: ${error.message}") }
+ * ```
+ *
+ * @property enabled Whether auto-reconnect is enabled (default: false)
+ * @property retryConfig Retry configuration for reconnection attempts
+ * @property maxLifetimeReconnects Maximum total reconnection attempts across all disconnections (0 = unlimited)
+ */
+data class W4RPAutoReconnectConfig(
+    val enabled: Boolean = false,
+    val retryConfig: W4RPRetryConfig = W4RPRetryConfig.DEFAULT,
+    val maxLifetimeReconnects: Int = 0
+) {
+    companion object {
+        /** Disabled configuration (default) */
+        val DISABLED = W4RPAutoReconnectConfig(enabled = false)
+        
+        /** Default enabled configuration: up to 5 reconnect attempts */
+        val DEFAULT = W4RPAutoReconnectConfig(
+            enabled = true,
+            retryConfig = W4RPRetryConfig(maxRetries = 5, baseDelayMs = 2000)
+        )
+    }
+}
+
+// =============================================================================
 // Bridge
 // =============================================================================
 
@@ -252,6 +332,21 @@ class W4RPBridge(private val context: Context) {
     var onDebugData: ((W4RPDebugData) -> Unit)? = null
     var onDisconnect: (() -> Unit)? = null
     
+    // Auto-reconnect Callbacks
+    /** Called when auto-reconnect starts (provides attempt number) */
+    var onReconnecting: ((attempt: Int) -> Unit)? = null
+    /** Called when auto-reconnect succeeds */
+    var onReconnected: (() -> Unit)? = null
+    /** Called when auto-reconnect fails after all attempts */
+    var onReconnectFailed: ((error: W4RPException) -> Unit)? = null
+    
+    // -------------------------------------------------------------------------
+    // Configuration
+    // -------------------------------------------------------------------------
+    
+    /** Auto-reconnect configuration (default: disabled) */
+    var autoReconnectConfig: W4RPAutoReconnectConfig = W4RPAutoReconnectConfig.DISABLED
+    
     // -------------------------------------------------------------------------
     // Private State
     // -------------------------------------------------------------------------
@@ -278,6 +373,12 @@ class W4RPBridge(private val context: Context) {
     private var streamBuffer = ByteArray(0)
     private var streamExpectedLen = 0
     private var streamExpectedCRC: Long = 0
+    
+    // Auto-reconnect State
+    private var lastConnectedDevice: W4RPDevice? = null
+    private var isAutoReconnecting = false
+    private var lifetimeReconnectCount = 0
+    private var wasIntentionalDisconnect = false
     
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
@@ -342,6 +443,8 @@ class W4RPBridge(private val context: Context) {
         stopScan()
         _connectionState.value = W4RPConnectionState.CONNECTING
         _lastError.value = null
+        wasIntentionalDisconnect = false
+        lastConnectedDevice = device
         
         return suspendCancellableCoroutine { continuation ->
             connectContinuation = continuation
@@ -370,6 +473,65 @@ class W4RPBridge(private val context: Context) {
     }
     
     /**
+     * Connect to a device with automatic retry using exponential backoff.
+     *
+     * This method wraps `connect()` and automatically retries on failure using
+     * exponential backoff delays (e.g., 1s → 2s → 4s → 8s).
+     *
+     * @param device Device to connect to
+     * @param timeoutMs Connection timeout in milliseconds per attempt (default: 10000)
+     * @param retryConfig Retry configuration (default: 3 retries, 1s base delay)
+     * @param onRetry Optional callback invoked before each retry attempt with (attempt, delayMs, error)
+     * @throws W4RPException if all attempts fail
+     *
+     * ```kotlin
+     * bridge.connectWithRetry(device) { attempt, delayMs, error ->
+     *     Log.d("W4RP", "Retry $attempt after ${delayMs}ms: ${error.message}")
+     * }
+     * ```
+     */
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    suspend fun connectWithRetry(
+        device: W4RPDevice,
+        timeoutMs: Long = 10000,
+        retryConfig: W4RPRetryConfig = W4RPRetryConfig.DEFAULT,
+        onRetry: ((attempt: Int, delayMs: Long, error: W4RPException) -> Unit)? = null
+    ) {
+        var lastError: W4RPException? = null
+        
+        for (attempt in 0..retryConfig.maxRetries) {
+            try {
+                connect(device, timeoutMs)
+                return // Success
+            } catch (error: W4RPException) {
+                lastError = error
+                
+                // Don't retry for certain errors
+                if (error.errorCode == W4RPErrorCode.ALREADY_CONNECTED) {
+                    throw error
+                }
+                
+                // If we've exhausted retries, throw
+                if (attempt >= retryConfig.maxRetries) {
+                    throw error
+                }
+                
+                // Calculate delay and wait
+                val delayMs = retryConfig.delayForAttempt(attempt)
+                onRetry?.invoke(attempt + 1, delayMs, error)
+                
+                // Ensure we're in a clean state before retrying
+                _connectionState.value = W4RPConnectionState.DISCONNECTED
+                
+                delay(delayMs)
+            }
+        }
+        
+        // Should not reach here, but safety fallback
+        lastError?.let { throw it }
+    }
+    
+    /**
      * Disconnect from the current device.
      *
      * @throws W4RPException if disconnection fails
@@ -378,6 +540,7 @@ class W4RPBridge(private val context: Context) {
     suspend fun disconnect() {
         if (bluetoothGatt == null) return
         
+        wasIntentionalDisconnect = true
         _connectionState.value = W4RPConnectionState.DISCONNECTING
         
         return suspendCancellableCoroutine { continuation ->
@@ -730,6 +893,7 @@ class W4RPBridge(private val context: Context) {
                         gatt.discoverServices()
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
+                        val previousState = _connectionState.value
                         _connectionState.value = W4RPConnectionState.DISCONNECTED
                         rxCharacteristic = null
                         txCharacteristic = null
@@ -737,9 +901,59 @@ class W4RPBridge(private val context: Context) {
                         bluetoothGatt?.close()
                         bluetoothGatt = null
                         
+                        // Resume any pending disconnect continuation
                         disconnectContinuation?.resume(Unit)
                         disconnectContinuation = null
                         onDisconnect?.invoke()
+                        
+                        // Check for auto-reconnect
+                        val device = lastConnectedDevice
+                        if (!wasIntentionalDisconnect &&
+                            autoReconnectConfig.enabled &&
+                            (previousState == W4RPConnectionState.READY || previousState == W4RPConnectionState.DISCOVERING_SERVICES) &&
+                            device != null &&
+                            !isAutoReconnecting
+                        ) {
+                            // Check lifetime reconnect limit
+                            if (autoReconnectConfig.maxLifetimeReconnects > 0 &&
+                                lifetimeReconnectCount >= autoReconnectConfig.maxLifetimeReconnects) {
+                                val err = W4RPException(W4RPErrorCode.CONNECTION_FAILED, "Max lifetime reconnects exceeded")
+                                onReconnectFailed?.invoke(err)
+                                wasIntentionalDisconnect = false
+                                return@post
+                            }
+                            
+                            // Start auto-reconnect
+                            isAutoReconnecting = true
+                            
+                            scope.launch {
+                                var lastReconnectError: W4RPException? = null
+                                
+                                for (attempt in 0..autoReconnectConfig.retryConfig.maxRetries) {
+                                    lifetimeReconnectCount++
+                                    onReconnecting?.invoke(attempt + 1)
+                                    
+                                    try {
+                                        connect(device)
+                                        isAutoReconnecting = false
+                                        onReconnected?.invoke()
+                                        return@launch
+                                    } catch (error: W4RPException) {
+                                        lastReconnectError = error
+                                        
+                                        if (attempt < autoReconnectConfig.retryConfig.maxRetries) {
+                                            val delayMs = autoReconnectConfig.retryConfig.delayForAttempt(attempt)
+                                            delay(delayMs)
+                                        }
+                                    }
+                                }
+                                
+                                isAutoReconnecting = false
+                                onReconnectFailed?.invoke(lastReconnectError ?: W4RPException(W4RPErrorCode.CONNECTION_FAILED, "Auto-reconnect failed"))
+                            }
+                        }
+                        
+                        wasIntentionalDisconnect = false
                     }
                 }
             }

@@ -244,8 +244,8 @@ Future improvements planned for W4RP-BRIDGE:
 - [x] **Async/Await API** - Native async/await patterns (Swift 5.5+ `async throws`, Kotlin Coroutines `suspend`, TypeScript `async`). Legacy callback APIs maintained for backward compatibility.
 - [x] **OTA Progress Callbacks** - All implementations now support `onProgress(bytesWritten, totalBytes)` callback for firmware updates and rule uploads. Callback is optional.
 - [x] **Connection State Machine** - All implementations now export `W4RPConnectionState` enum with states: `DISCONNECTED`, `SCANNING`, `CONNECTING`, `DISCOVERING_SERVICES`, `READY`, `DISCONNECTING`, `ERROR`. Added `connectionState` and `lastError` properties. Backward-compatible `isConnected` preserved.
-- [ ] **Retry with Exponential Backoff** - Built-in retry logic for flaky BLE connections (configurable max retries, 1s → 2s → 4s delays)
-- [ ] **Automatic Reconnection** - Optional auto-reconnect when connection is lost unexpectedly
+- [x] **Retry with Exponential Backoff** - All implementations now provide `connectWithRetry()` method with configurable `W4RPRetryConfig` (maxRetries, baseDelay, maxDelay, multiplier). Includes `onRetry` callback for monitoring attempts.
+- [x] **Automatic Reconnection** - All implementations now support optional auto-reconnect via `W4RPAutoReconnectConfig` with `onReconnecting`, `onReconnected`, `onReconnectFailed` callbacks. Uses exponential backoff and supports lifetime reconnect limits.
 - [ ] **Package Distribution** - Publish to Swift Package Manager (SPM), Maven Central / JitPack, and npm
 
 Contributions welcome! See individual implementation files for platform-specific notes.

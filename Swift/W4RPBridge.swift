@@ -213,7 +213,101 @@ public enum W4RPConnectionState: String, Sendable {
     }
 }
 
-// MARK: - Bridge
+// MARK: - Retry Configuration
+
+/**
+ * Configuration for exponential backoff retry logic.
+ *
+ * Example usage:
+ * ```swift
+ * let config = W4RPRetryConfig(maxRetries: 3, baseDelay: 1.0, maxDelay: 8.0)
+ * try await bridge.connectWithRetry(to: device, retryConfig: config)
+ * ```
+ */
+public struct W4RPRetryConfig: Sendable {
+    /// Maximum number of retry attempts (0 = no retries, just the initial attempt)
+    public let maxRetries: Int
+    
+    /// Base delay in seconds before first retry (default: 1.0)
+    public let baseDelay: TimeInterval
+    
+    /// Maximum delay cap in seconds (default: 16.0)
+    public let maxDelay: TimeInterval
+    
+    /// Multiplier for exponential growth (default: 2.0)
+    public let multiplier: Double
+    
+    /// Default configuration: 3 retries, 1s base, 16s max, 2x multiplier
+    public static let `default` = W4RPRetryConfig()
+    
+    public init(
+        maxRetries: Int = 3,
+        baseDelay: TimeInterval = 1.0,
+        maxDelay: TimeInterval = 16.0,
+        multiplier: Double = 2.0
+    ) {
+        self.maxRetries = maxRetries
+        self.baseDelay = baseDelay
+        self.maxDelay = maxDelay
+        self.multiplier = multiplier
+    }
+    
+    /// Calculate delay for a given attempt (0-indexed)
+    public func delay(forAttempt attempt: Int) -> TimeInterval {
+        let delay = baseDelay * pow(multiplier, Double(attempt))
+        return min(delay, maxDelay)
+    }
+}
+
+// MARK: - Auto-Reconnect Configuration
+
+/**
+ * Configuration for automatic reconnection when connection is lost unexpectedly.
+ *
+ * When enabled, the bridge will attempt to reconnect automatically if the connection
+ * is lost (e.g., device goes out of range, power loss). The reconnection uses
+ * exponential backoff as configured in `retryConfig`.
+ *
+ * Example usage:
+ * ```swift
+ * bridge.autoReconnectConfig = W4RPAutoReconnectConfig(
+ *     enabled: true,
+ *     retryConfig: W4RPRetryConfig(maxRetries: 5)
+ * )
+ * bridge.onReconnecting = { attempt in print("Reconnecting attempt \(attempt)...") }
+ * bridge.onReconnected = { print("Reconnected!") }
+ * bridge.onReconnectFailed = { error in print("Failed: \(error)") }
+ * ```
+ */
+public struct W4RPAutoReconnectConfig: Sendable {
+    /// Whether auto-reconnect is enabled (default: false)
+    public let enabled: Bool
+    
+    /// Retry configuration for reconnection attempts
+    public let retryConfig: W4RPRetryConfig
+    
+    /// Maximum total reconnection attempts across all disconnections (0 = unlimited)
+    public let maxLifetimeReconnects: Int
+    
+    /// Disabled configuration (default)
+    public static let disabled = W4RPAutoReconnectConfig(enabled: false)
+    
+    /// Default enabled configuration: up to 5 reconnect attempts
+    public static let `default` = W4RPAutoReconnectConfig(
+        enabled: true,
+        retryConfig: W4RPRetryConfig(maxRetries: 5, baseDelay: 2.0)
+    )
+    
+    public init(
+        enabled: Bool = false,
+        retryConfig: W4RPRetryConfig = .default,
+        maxLifetimeReconnects: Int = 0
+    ) {
+        self.enabled = enabled
+        self.retryConfig = retryConfig
+        self.maxLifetimeReconnects = maxLifetimeReconnects
+    }
+}
 
 /**
  * W4RPBridge - CoreBluetooth client for W4RPBLE modules.
@@ -271,12 +365,21 @@ public final class W4RPBridge: NSObject, ObservableObject {
     
     public var uuids: W4RPUUIDs = .default
     
+    /// Auto-reconnect configuration (default: disabled)
+    public var autoReconnectConfig: W4RPAutoReconnectConfig = .disabled
+    
     // MARK: - Callbacks
     
     /// Called when module sends a status update
     public var onStatusUpdate: ((String) -> Void)?
     /// Called when debug data is received
     public var onDebugData: ((W4RPDebugData) -> Void)?
+    /// Called when auto-reconnect starts (provides attempt number)
+    public var onReconnecting: ((Int) -> Void)?
+    /// Called when auto-reconnect succeeds
+    public var onReconnected: (() -> Void)?
+    /// Called when auto-reconnect fails after all attempts
+    public var onReconnectFailed: ((W4RPError) -> Void)?
     
     // MARK: - Private State
     
@@ -289,6 +392,12 @@ public final class W4RPBridge: NSObject, ObservableObject {
     private var deviceMap: [UUID: W4RPDevice] = [:]
     private var scanTimer: Timer?
     private var connectionTimer: Timer?
+    
+    // Auto-reconnect State
+    private var lastConnectedDevice: W4RPDevice?
+    private var isAutoReconnecting = false
+    private var lifetimeReconnectCount = 0
+    private var wasIntentionalDisconnect = false
     
     // Stream State
     private var streamActive = false
@@ -356,6 +465,8 @@ public final class W4RPBridge: NSObject, ObservableObject {
         stopScan()
         connectionState = .connecting
         lastError = nil
+        wasIntentionalDisconnect = false
+        lastConnectedDevice = device
         
         return try await withCheckedThrowingContinuation { continuation in
             connectContinuation = continuation
@@ -377,6 +488,66 @@ public final class W4RPBridge: NSObject, ObservableObject {
     }
     
     /**
+     * Connect to a device with automatic retry using exponential backoff.
+     *
+     * This method wraps `connect()` and automatically retries on failure using
+     * exponential backoff delays (e.g., 1s → 2s → 4s → 8s).
+     *
+     * - Parameter device: Device to connect to
+     * - Parameter timeout: Connection timeout in seconds per attempt (default: 10)
+     * - Parameter retryConfig: Retry configuration (default: 3 retries, 1s base delay)
+     * - Parameter onRetry: Optional callback invoked before each retry attempt with (attempt, delay, error)
+     * - Throws: `W4RPError` if all attempts fail
+     *
+     * ```swift
+     * try await bridge.connectWithRetry(to: device) { attempt, delay, error in
+     *     print("Retry \(attempt) after \(delay)s: \(error)")
+     * }
+     * ```
+     */
+    public func connectWithRetry(
+        to device: W4RPDevice,
+        timeout: TimeInterval = 10.0,
+        retryConfig: W4RPRetryConfig = .default,
+        onRetry: ((Int, TimeInterval, W4RPError) -> Void)? = nil
+    ) async throws {
+        var lastError: W4RPError?
+        
+        for attempt in 0...retryConfig.maxRetries {
+            do {
+                try await connect(to: device, timeout: timeout)
+                return // Success
+            } catch let error as W4RPError {
+                lastError = error
+                
+                // Don't retry for certain errors
+                if error.code == .alreadyConnected {
+                    throw error
+                }
+                
+                // If we've exhausted retries, throw
+                if attempt >= retryConfig.maxRetries {
+                    throw error
+                }
+                
+                // Calculate delay and wait
+                let delay = retryConfig.delay(forAttempt: attempt)
+                onRetry?(attempt + 1, delay, error)
+                
+                // Ensure we're in a clean state before retrying
+                connectionState = .disconnected
+                
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        
+        // Should not reach here, but safety fallback
+        if let error = lastError {
+            throw error
+        }
+    }
+    
+    /**
      * Disconnect from the current device.
      *
      * - Throws: `W4RPError` if disconnection fails
@@ -384,6 +555,7 @@ public final class W4RPBridge: NSObject, ObservableObject {
     public func disconnect() async throws {
         guard let p = peripheral else { return }
         
+        wasIntentionalDisconnect = true
         connectionState = .disconnecting
         
         return try await withCheckedThrowingContinuation { continuation in
@@ -773,6 +945,7 @@ extension W4RPBridge: CBCentralManagerDelegate {
     }
     
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        let previousState = connectionState
         connectionState = .disconnected
         rxChar = nil
         txChar = nil
@@ -780,8 +953,56 @@ extension W4RPBridge: CBCentralManagerDelegate {
         self.peripheral = nil
         connectedDeviceName = nil
         
+        // Resume any pending disconnect continuation
         disconnectContinuation?.resume()
         disconnectContinuation = nil
+        
+        // Check for auto-reconnect
+        guard !wasIntentionalDisconnect,
+              autoReconnectConfig.enabled,
+              previousState == .ready || previousState == .discoveringServices,
+              let device = lastConnectedDevice,
+              !isAutoReconnecting else {
+            wasIntentionalDisconnect = false
+            return
+        }
+        
+        // Check lifetime reconnect limit
+        if autoReconnectConfig.maxLifetimeReconnects > 0 &&
+           lifetimeReconnectCount >= autoReconnectConfig.maxLifetimeReconnects {
+            let err = W4RPError(.connectionFailed, "Max lifetime reconnects exceeded")
+            onReconnectFailed?(err)
+            return
+        }
+        
+        // Start auto-reconnect
+        isAutoReconnecting = true
+        
+        Task { @MainActor in
+            var lastReconnectError: W4RPError?
+            
+            for attempt in 0...autoReconnectConfig.retryConfig.maxRetries {
+                lifetimeReconnectCount += 1
+                onReconnecting?(attempt + 1)
+                
+                do {
+                    try await connect(to: device)
+                    isAutoReconnecting = false
+                    onReconnected?()
+                    return
+                } catch let error as W4RPError {
+                    lastReconnectError = error
+                    
+                    if attempt < autoReconnectConfig.retryConfig.maxRetries {
+                        let delay = autoReconnectConfig.retryConfig.delay(forAttempt: attempt)
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    }
+                }
+            }
+            
+            isAutoReconnecting = false
+            onReconnectFailed?(lastReconnectError ?? W4RPError(.connectionFailed, "Auto-reconnect failed"))
+        }
     }
 }
 

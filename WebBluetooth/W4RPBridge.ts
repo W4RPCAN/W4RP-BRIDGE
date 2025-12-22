@@ -296,6 +296,104 @@ export enum W4RPConnectionState {
 }
 
 // =============================================================================
+// Retry Configuration
+// =============================================================================
+
+/**
+ * Configuration for exponential backoff retry logic.
+ *
+ * Example usage:
+ * ```typescript
+ * const config: W4RPRetryConfig = { maxRetries: 3, baseDelayMs: 1000 };
+ * await bridge.connectWithRetry(config);
+ * ```
+ */
+export interface W4RPRetryConfig {
+    /** Maximum number of retry attempts (0 = no retries, just the initial attempt) */
+    maxRetries: number;
+
+    /** Base delay in milliseconds before first retry (default: 1000) */
+    baseDelayMs: number;
+
+    /** Maximum delay cap in milliseconds (default: 16000) */
+    maxDelayMs: number;
+
+    /** Multiplier for exponential growth (default: 2.0) */
+    multiplier: number;
+}
+
+/** Default retry configuration: 3 retries, 1s base, 16s max, 2x multiplier */
+export const W4RP_DEFAULT_RETRY_CONFIG: W4RPRetryConfig = {
+    maxRetries: 3,
+    baseDelayMs: 1000,
+    maxDelayMs: 16000,
+    multiplier: 2.0,
+};
+
+/**
+ * Calculate delay for a given attempt using exponential backoff.
+ * @param config Retry configuration
+ * @param attempt Attempt number (0-indexed)
+ * @returns Delay in milliseconds
+ */
+export function calculateRetryDelay(config: W4RPRetryConfig, attempt: number): number {
+    const delay = config.baseDelayMs * Math.pow(config.multiplier, attempt);
+    return Math.min(delay, config.maxDelayMs);
+}
+
+/** Callback type for retry events */
+export type W4RPRetryCallback = (attempt: number, delayMs: number, error: W4RPError) => void;
+
+// =============================================================================
+// Auto-Reconnect Configuration
+// =============================================================================
+
+/**
+ * Configuration for automatic reconnection when connection is lost unexpectedly.
+ *
+ * When enabled, the bridge will attempt to reconnect automatically if the connection
+ * is lost (e.g., device goes out of range). The reconnection uses exponential backoff.
+ *
+ * IMPORTANT: Due to Web Bluetooth security requirements, auto-reconnect may not work
+ * in all browsers as reconnection typically requires a new user gesture.
+ *
+ * @example
+ * ```typescript
+ * bridge.autoReconnectConfig = { enabled: true, retryConfig: W4RP_DEFAULT_RETRY_CONFIG };
+ * bridge.onReconnecting = (attempt) => console.log(`Reconnecting attempt ${attempt}...`);
+ * bridge.onReconnected = () => console.log('Reconnected!');
+ * bridge.onReconnectFailed = (error) => console.error('Failed:', error);
+ * ```
+ */
+export interface W4RPAutoReconnectConfig {
+    /** Whether auto-reconnect is enabled (default: false) */
+    enabled: boolean;
+
+    /** Retry configuration for reconnection attempts */
+    retryConfig: W4RPRetryConfig;
+
+    /** Maximum total reconnection attempts across all disconnections (0 = unlimited) */
+    maxLifetimeReconnects: number;
+}
+
+/** Disabled auto-reconnect configuration (default) */
+export const W4RP_DISABLED_AUTO_RECONNECT: W4RPAutoReconnectConfig = {
+    enabled: false,
+    retryConfig: W4RP_DEFAULT_RETRY_CONFIG,
+    maxLifetimeReconnects: 0,
+};
+
+/** Default enabled auto-reconnect configuration: up to 5 reconnect attempts */
+export const W4RP_DEFAULT_AUTO_RECONNECT: W4RPAutoReconnectConfig = {
+    enabled: true,
+    retryConfig: { ...W4RP_DEFAULT_RETRY_CONFIG, maxRetries: 5, baseDelayMs: 2000 },
+    maxLifetimeReconnects: 0,
+};
+
+/** Callback type for reconnect events */
+export type W4RPReconnectCallback = (attempt: number) => void;
+
+// =============================================================================
 // Main Bridge Class
 // =============================================================================
 
@@ -336,8 +434,31 @@ export class W4RPBridge {
     private streamReject: ((error: W4RPError) => void) | null = null;
     private streamTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
+    // Auto-reconnect State
+    private wasIntentionalDisconnect = false;
+    private isAutoReconnecting = false;
+    private lifetimeReconnectCount = 0;
+
     // Event Callbacks
     private callbacks: W4RPBridgeCallbacks = {};
+
+    // ---------------------------------------------------------------------------
+    // Configuration
+    // ---------------------------------------------------------------------------
+
+    /** Auto-reconnect configuration (default: disabled) */
+    autoReconnectConfig: W4RPAutoReconnectConfig = W4RP_DISABLED_AUTO_RECONNECT;
+
+    // ---------------------------------------------------------------------------
+    // Auto-Reconnect Callbacks
+    // ---------------------------------------------------------------------------
+
+    /** Called when auto-reconnect starts (provides attempt number) */
+    onReconnecting: W4RPReconnectCallback | null = null;
+    /** Called when auto-reconnect succeeds */
+    onReconnected: (() => void) | null = null;
+    /** Called when auto-reconnect fails after all attempts */
+    onReconnectFailed: ((error: W4RPError) => void) | null = null;
 
     // ---------------------------------------------------------------------------
     // Public Getters
@@ -486,9 +607,84 @@ export class W4RPBridge {
     }
 
     /**
+     * Connect to a device with automatic retry using exponential backoff.
+     *
+     * This method wraps `connect()` and automatically retries on failure using
+     * exponential backoff delays (e.g., 1s → 2s → 4s → 8s).
+     *
+     * IMPORTANT: Due to Web Bluetooth security requirements, the initial connection
+     * MUST be triggered by a user gesture. Retry attempts may fail if the browser
+     * requires a new user gesture for each connection attempt.
+     *
+     * @param retryConfig - Retry configuration (default: 3 retries, 1s base delay)
+     * @param onRetry - Optional callback invoked before each retry attempt
+     * @throws {W4RPError} If all attempts fail
+     *
+     * @example
+     * ```typescript
+     * await bridge.connectWithRetry(W4RP_DEFAULT_RETRY_CONFIG, (attempt, delay, error) => {
+     *     console.log(`Retry ${attempt} after ${delay}ms: ${error.message}`);
+     * });
+     * ```
+     */
+    async connectWithRetry(
+        retryConfig: W4RPRetryConfig = W4RP_DEFAULT_RETRY_CONFIG,
+        onRetry?: W4RPRetryCallback
+    ): Promise<void> {
+        let lastError: W4RPError | null = null;
+
+        for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
+            try {
+                await this.connect();
+                return; // Success
+            } catch (error) {
+                if (error instanceof W4RPError) {
+                    lastError = error;
+
+                    // Don't retry for certain errors
+                    if (error.code === W4RPErrorCode.ALREADY_CONNECTED) {
+                        throw error;
+                    }
+
+                    // User cancelled - don't retry
+                    if (error.code === W4RPErrorCode.DEVICE_NOT_FOUND) {
+                        throw error;
+                    }
+
+                    // If we've exhausted retries, throw
+                    if (attempt >= retryConfig.maxRetries) {
+                        throw error;
+                    }
+
+                    // Calculate delay and wait
+                    const delayMs = calculateRetryDelay(retryConfig, attempt);
+                    onRetry?.(attempt + 1, delayMs, error);
+
+                    // Ensure we're in a clean state before retrying
+                    this._connectionState = W4RPConnectionState.DISCONNECTED;
+
+                    await this.delay(delayMs);
+                } else {
+                    // Unknown error, wrap and throw
+                    throw new W4RPError(
+                        W4RPErrorCode.CONNECTION_FAILED,
+                        `Connection failed: ${error instanceof Error ? error.message : String(error)}`
+                    );
+                }
+            }
+        }
+
+        // Should not reach here, but safety fallback
+        if (lastError) {
+            throw lastError;
+        }
+    }
+
+    /**
      * Disconnect from the currently connected device.
      */
     disconnect(): void {
+        this.wasIntentionalDisconnect = true;
         this._connectionState = W4RPConnectionState.DISCONNECTING;
         this.server?.disconnect();
         this.handleDisconnect();
@@ -741,13 +937,106 @@ export class W4RPBridge {
 
     /** Handle disconnection */
     private handleDisconnect(): void {
+        const previousState = this._connectionState;
+        const device = this.device;
+
         this._connectionState = W4RPConnectionState.DISCONNECTED;
-        this.device = null;
         this.server = null;
         this.rxCharacteristic = null;
         this.txCharacteristic = null;
         this.statusCharacteristic = null;
         this.callbacks.onDisconnect?.();
+
+        // Check for auto-reconnect
+        // Note: Web Bluetooth can reconnect to a previously paired device without a new user gesture
+        if (!this.wasIntentionalDisconnect &&
+            this.autoReconnectConfig.enabled &&
+            (previousState === W4RPConnectionState.READY || previousState === W4RPConnectionState.DISCOVERING_SERVICES) &&
+            device?.gatt &&
+            !this.isAutoReconnecting
+        ) {
+            // Check lifetime reconnect limit
+            if (this.autoReconnectConfig.maxLifetimeReconnects > 0 &&
+                this.lifetimeReconnectCount >= this.autoReconnectConfig.maxLifetimeReconnects) {
+                const err = new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Max lifetime reconnects exceeded');
+                this.onReconnectFailed?.(err);
+                this.wasIntentionalDisconnect = false;
+                return;
+            }
+
+            // Start auto-reconnect
+            this.isAutoReconnecting = true;
+            this.attemptAutoReconnect(device);
+        }
+
+        this.wasIntentionalDisconnect = false;
+    }
+
+    /** Attempt to auto-reconnect to a device */
+    private async attemptAutoReconnect(device: BluetoothDevice): Promise<void> {
+        let lastReconnectError: W4RPError | null = null;
+
+        for (let attempt = 0; attempt <= this.autoReconnectConfig.retryConfig.maxRetries; attempt++) {
+            this.lifetimeReconnectCount++;
+            this.onReconnecting?.(attempt + 1);
+
+            try {
+                // Attempt to reconnect using cached device
+                if (!device.gatt) {
+                    throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Device GATT not available');
+                }
+
+                this._connectionState = W4RPConnectionState.CONNECTING;
+                this.server = await device.gatt.connect();
+
+                if (!this.server) {
+                    throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Failed to connect to GATT server');
+                }
+
+                this._connectionState = W4RPConnectionState.DISCOVERING_SERVICES;
+                const service = await this.server.getPrimaryService(W4RP_UUIDS.SERVICE);
+                this.rxCharacteristic = await service.getCharacteristic(W4RP_UUIDS.RX);
+                this.txCharacteristic = await service.getCharacteristic(W4RP_UUIDS.TX);
+                this.statusCharacteristic = await service.getCharacteristic(W4RP_UUIDS.STATUS);
+
+                // Re-subscribe to notifications
+                await this.rxCharacteristic.startNotifications();
+                this.rxCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
+                    const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
+                    if (value) {
+                        this.handleTX(new Uint8Array(value.buffer));
+                    }
+                });
+
+                await this.statusCharacteristic.startNotifications();
+                this.statusCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
+                    const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
+                    if (value) {
+                        const text = new TextDecoder().decode(value);
+                        this.callbacks.onStatusUpdate?.(text);
+                    }
+                });
+
+                this._connectionState = W4RPConnectionState.READY;
+                this._lastError = null;
+                this.isAutoReconnecting = false;
+                this.onReconnected?.();
+                return;
+            } catch (error) {
+                lastReconnectError = error instanceof W4RPError
+                    ? error
+                    : new W4RPError(W4RPErrorCode.CONNECTION_FAILED, `Reconnect failed: ${error instanceof Error ? error.message : String(error)}`);
+
+                if (attempt < this.autoReconnectConfig.retryConfig.maxRetries) {
+                    const delayMs = calculateRetryDelay(this.autoReconnectConfig.retryConfig, attempt);
+                    await this.delay(delayMs);
+                }
+            }
+        }
+
+        this._connectionState = W4RPConnectionState.DISCONNECTED;
+        this.isAutoReconnecting = false;
+        this.onReconnectFailed?.(lastReconnectError ?? new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Auto-reconnect failed'));
     }
 
     /** Promise-based delay */
