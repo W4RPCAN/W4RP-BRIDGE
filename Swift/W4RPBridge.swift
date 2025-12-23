@@ -341,6 +341,11 @@ public struct W4RPAutoReconnectConfig: Sendable {
 @MainActor
 public final class W4RPBridge: NSObject, ObservableObject {
     
+    // MARK: - Platform Identifier (standardized across iOS, Android, Web)
+    
+    /// Platform identifier - 'ios' for Swift, 'android' for Kotlin, 'web' for TypeScript
+    public let platform: String = "ios"
+    
     // MARK: - Published State
     
     /// Current connection state (replaces deprecated isConnected)

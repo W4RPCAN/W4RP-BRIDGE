@@ -303,6 +303,13 @@ data class W4RPAutoReconnectConfig(
 class W4RPBridge(private val context: Context) {
     
     // -------------------------------------------------------------------------
+    // Platform Identifier (standardized across iOS, Android, Web)
+    // -------------------------------------------------------------------------
+    
+    /** Platform identifier - 'android' for Kotlin, 'ios' for Swift, 'web' for TypeScript */
+    val platform: String = "android"
+    
+    // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
     

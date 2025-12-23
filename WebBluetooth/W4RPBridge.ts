@@ -254,6 +254,19 @@ export interface W4RPBridgeCallbacks {
 }
 
 /**
+ * Standardized device representation.
+ * Used across iOS, Android, and Web platforms.
+ */
+export interface W4RPDevice {
+    /** Unique device identifier */
+    id: string;
+    /** Device name (from BLE advertisement) */
+    name: string;
+    /** Signal strength in dBm (0 if not available) */
+    rssi: number;
+}
+
+/**
  * Progress callback for upload operations.
  * @param bytesWritten - Bytes written so far
  * @param totalBytes - Total bytes to write
@@ -278,6 +291,9 @@ export type W4RPProgressCallback = (bytesWritten: number, totalBytes: number) =>
 export enum W4RPConnectionState {
     /** Not connected to any device */
     DISCONNECTED = 'DISCONNECTED',
+
+    /** Scanning for nearby W4RP devices */
+    SCANNING = 'SCANNING',
 
     /** Initiating GATT connection to a device */
     CONNECTING = 'CONNECTING',
@@ -414,12 +430,22 @@ export type W4RPReconnectCallback = (attempt: number) => void;
  * ```
  */
 export class W4RPBridge {
+    // ---------------------------------------------------------------------------
+    // Platform Identifier (standardized across iOS, Android, Web)
+    // ---------------------------------------------------------------------------
+
+    /** Platform identifier - 'web' for Web Bluetooth, 'ios' for Swift, 'android' for Kotlin */
+    readonly platform: 'web' | 'ios' | 'android' = 'web';
+
     // BLE State
     private device: BluetoothDevice | null = null;
     private server: BluetoothRemoteGATTServer | null = null;
     private rxCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
     private txCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
     private statusCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
+
+    // Device Cache (for scan -> connect flow)
+    private discoveredDevices: Map<string, BluetoothDevice> = new Map();
 
     // Connection State
     private _connectionState: W4RPConnectionState = W4RPConnectionState.DISCONNECTED;
@@ -510,18 +536,99 @@ export class W4RPBridge {
     }
 
     /**
-     * Request and connect to a W4RP device.
+     * Scan for W4RP devices.
      * 
      * IMPORTANT: This method MUST be called from a user gesture (e.g., button click)
      * due to Web Bluetooth security requirements.
      * 
-     * @throws {W4RPError} If connection fails or is not supported
+     * Note: Web Bluetooth shows a picker dialog rather than returning a list.
+     * The selected device is cached and returned as a single-item array.
+     * Use connect(deviceId) after scan to complete the connection.
+     * 
+     * @param _timeoutMs - Ignored for Web Bluetooth (picker is modal)
+     * @returns Array of discovered devices (typically one device from picker)
+     * @throws {W4RPError} If Bluetooth is unsupported or user cancels
      */
-    async connect(): Promise<void> {
+    async scan(_timeoutMs: number = 8000): Promise<W4RPDevice[]> {
         if (!W4RPBridge.isSupported()) {
             throw new W4RPError(
                 W4RPErrorCode.BLUETOOTH_UNSUPPORTED,
                 'Web Bluetooth is not supported in this browser. Use Chrome, Edge, or Opera.'
+            );
+        }
+
+        this._connectionState = W4RPConnectionState.SCANNING;
+        this._lastError = null;
+
+        try {
+            // Request device - shows browser's device picker
+            const device = await navigator.bluetooth.requestDevice({
+                filters: [{ services: [W4RP_UUIDS.SERVICE] }],
+            });
+
+            if (!device) {
+                this._connectionState = W4RPConnectionState.DISCONNECTED;
+                throw new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'No device was selected');
+            }
+
+            // Cache the device for connect()
+            this.discoveredDevices.set(device.id, device);
+
+            this._connectionState = W4RPConnectionState.DISCONNECTED;
+
+            // Return standardized device format matching Swift/Kotlin
+            return [{
+                id: device.id,
+                name: device.name || 'Unknown W4RP Device',
+                rssi: 0 // Not available from Web Bluetooth picker
+            }];
+
+        } catch (error) {
+            this._connectionState = W4RPConnectionState.DISCONNECTED;
+
+            if (error instanceof W4RPError) {
+                this._lastError = error;
+                throw error;
+            }
+
+            // Handle browser-specific errors
+            const message = error instanceof Error ? error.message : String(error);
+            if (message.includes('User cancelled') || message.includes('user gesture')) {
+                const err = new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'Device selection was cancelled');
+                this._lastError = err;
+                throw err;
+            }
+            const err = new W4RPError(W4RPErrorCode.SCAN_TIMEOUT, `Scan failed: ${message}`);
+            this._lastError = err;
+            throw err;
+        }
+    }
+
+    /**
+     * Stop scanning for devices.
+     * Note: No-op for Web Bluetooth since the picker is modal.
+     */
+    stopScan(): void {
+        if (this._connectionState === W4RPConnectionState.SCANNING) {
+            this._connectionState = W4RPConnectionState.DISCONNECTED;
+        }
+    }
+
+    /**
+     * Connect to a device by ID.
+     * 
+     * The device must have been discovered via scan() first.
+     * 
+     * @param deviceId - Device ID from scan() results
+     * @throws {W4RPError} If device not found or connection fails
+     */
+    async connect(deviceId: string): Promise<void> {
+        // Look up the device from cache
+        const device = this.discoveredDevices.get(deviceId);
+        if (!device) {
+            throw new W4RPError(
+                W4RPErrorCode.DEVICE_NOT_FOUND,
+                `Device with ID '${deviceId}' not found. Call scan() first.`
             );
         }
 
@@ -531,17 +638,10 @@ export class W4RPBridge {
 
         this._connectionState = W4RPConnectionState.CONNECTING;
         this._lastError = null;
+        this.device = device;
+        this.wasIntentionalDisconnect = false;
 
         try {
-            // Request device - shows browser's device picker
-            this.device = await navigator.bluetooth.requestDevice({
-                filters: [{ services: [W4RP_UUIDS.SERVICE] }],
-            });
-
-            if (!this.device) {
-                throw new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'No device was selected');
-            }
-
             // Listen for unexpected disconnection
             this.device.addEventListener('gattserverdisconnected', () => {
                 this.handleDisconnect();
@@ -593,13 +693,7 @@ export class W4RPBridge {
                 throw error;
             }
 
-            // Handle browser-specific errors
             const message = error instanceof Error ? error.message : String(error);
-            if (message.includes('User cancelled')) {
-                const err = new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'Device selection was cancelled');
-                this._lastError = err;
-                throw err;
-            }
             const err = new W4RPError(W4RPErrorCode.CONNECTION_FAILED, `Connection failed: ${message}`);
             this._lastError = err;
             throw err;
@@ -616,18 +710,21 @@ export class W4RPBridge {
      * MUST be triggered by a user gesture. Retry attempts may fail if the browser
      * requires a new user gesture for each connection attempt.
      *
+     * @param deviceId - Device ID from scan() results
      * @param retryConfig - Retry configuration (default: 3 retries, 1s base delay)
      * @param onRetry - Optional callback invoked before each retry attempt
      * @throws {W4RPError} If all attempts fail
      *
      * @example
      * ```typescript
-     * await bridge.connectWithRetry(W4RP_DEFAULT_RETRY_CONFIG, (attempt, delay, error) => {
+     * const devices = await bridge.scan();
+     * await bridge.connectWithRetry(devices[0].id, W4RP_DEFAULT_RETRY_CONFIG, (attempt, delay, error) => {
      *     console.log(`Retry ${attempt} after ${delay}ms: ${error.message}`);
      * });
      * ```
      */
     async connectWithRetry(
+        deviceId: string,
         retryConfig: W4RPRetryConfig = W4RP_DEFAULT_RETRY_CONFIG,
         onRetry?: W4RPRetryCallback
     ): Promise<void> {
@@ -635,7 +732,7 @@ export class W4RPBridge {
 
         for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
             try {
-                await this.connect();
+                await this.connect(deviceId);
                 return; // Success
             } catch (error) {
                 if (error instanceof W4RPError) {
@@ -1057,5 +1154,48 @@ export class W4RPBridge {
             }
         }
         return (crc ^ 0xffffffff) >>> 0;
+    }
+}
+
+// =============================================================================
+// Global Bridge Interface & Auto-Install
+// =============================================================================
+
+/**
+ * Global window declaration for W4RPBridge.
+ * 
+ * On all platforms, consumers should use: window.W4RPBridge
+ * - iOS: Native Swift bridge is injected by WKWebView
+ * - Android: Native Kotlin bridge is injected by WebView
+ * - Web: This TypeScript implementation auto-installs itself
+ */
+declare global {
+    interface Window {
+        /** Unified W4RP Bridge - available on all platforms */
+        W4RPBridge: W4RPBridge;
+    }
+}
+
+/**
+ * Auto-install W4RPBridge on window if:
+ * 1. We're in a browser environment
+ * 2. No native bridge has been injected (iOS/Android)
+ * 3. Web Bluetooth is supported
+ * 
+ * This ensures window.W4RPBridge is ALWAYS available, making the API
+ * truly unified across iOS, Android, and Web.
+ */
+if (typeof window !== 'undefined') {
+    // Only auto-install if no native bridge exists
+    if (!window.W4RPBridge) {
+        // Check Web Bluetooth support
+        if ('bluetooth' in navigator) {
+            window.W4RPBridge = new W4RPBridge();
+            console.log('[W4RP] Bridge auto-installed (platform: web)');
+        } else {
+            console.warn('[W4RP] Web Bluetooth not supported in this browser');
+        }
+    } else {
+        console.log(`[W4RP] Native bridge detected (platform: ${window.W4RPBridge.platform})`);
     }
 }
