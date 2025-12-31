@@ -1,417 +1,33 @@
 /**
- * W4RPBridge.ts
- * 
- * W4RP Bridge - Web Bluetooth API Implementation
- * Official client library for connecting to W4RPBLE firmware modules.
- * 
+ * BridgeBLE.ts
+ *
+ * Core Web Bluetooth Implementation for W4RP Bridge.
+ *
  * @license MIT
  * @copyright 2024 W4RP Automotive
- * @version 1.1.0
- * 
- * Compatible with:
- * - Chrome 56+ (Desktop & Android)
- * - Edge 79+
- * - Opera 43+
- * 
- * NOT compatible with:
- * - Firefox (Web Bluetooth not implemented)
- * - Safari / iOS (Web Bluetooth not implemented)
- * 
- * @see https://github.com/W4RPCAN/W4RPBLE for firmware source
- * @see https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API
+ * @version 2.0.0
  */
 
-// =============================================================================
-// UUID Configuration
-// =============================================================================
+/// <reference types="web-bluetooth" />
 
-/**
- * W4RP BLE Service and Characteristic UUIDs.
- * 
- * The UUID structure `5734-5250` encodes "W4RP" in ASCII hex:
- * - 0x57 = 'W'
- * - 0x34 = '4'
- * - 0x52 = 'R'
- * - 0x50 = 'P'
- * 
- * This provides a recognizable namespace while remaining valid per Bluetooth SIG spec.
- */
-export const W4RP_UUIDS = {
-    /** Primary GATT Service UUID - filter for this during scanning */
-    SERVICE: '0000fff0-5734-5250-5734-525000000000',
-
-    /** RX Characteristic - Write commands to the module */
-    RX: '0000fff1-5734-5250-5734-525000000000',
-
-    /** TX Characteristic - Receive data from module (Notify) */
-    TX: '0000fff2-5734-5250-5734-525000000000',
-
-    /** Status Characteristic - Module status updates (Notify) */
-    STATUS: '0000fff3-5734-5250-5734-525000000000',
-} as const;
-
-// =============================================================================
-// Error Handling
-// =============================================================================
-
-/**
- * Standardized error codes for W4RP operations.
- * 
- * Error code ranges:
- * - 1xxx: BLE Infrastructure errors (connection, scanning, permissions)
- * - 2xxx: Protocol errors (write failures, invalid responses)
- * - 3xxx: Data validation errors (CRC mismatch, length mismatch)
- * - 4xxx: Timeout errors (profile, stream, connection)
- */
-export enum W4RPErrorCode {
-    // -------------------------------------------------------------------------
-    // 1xxx: BLE Infrastructure
-    // -------------------------------------------------------------------------
-
-    /** GATT connection failed */
-    CONNECTION_FAILED = 1000,
-
-    /** Connection was lost unexpectedly */
-    CONNECTION_LOST = 1001,
-
-    /** Operation requires an active connection */
-    NOT_CONNECTED = 1002,
-
-    /** Already connected to a device */
-    ALREADY_CONNECTED = 1003,
-
-    /** No device was found or selected */
-    DEVICE_NOT_FOUND = 1004,
-
-    /** W4RP service not found on device */
-    SERVICE_NOT_FOUND = 1005,
-
-    /** Required characteristic not found */
-    CHARACTERISTIC_NOT_FOUND = 1006,
-
-    /** Bluetooth adapter is powered off */
-    BLUETOOTH_OFF = 1007,
-
-    /** Bluetooth permission denied by user or system */
-    BLUETOOTH_UNAUTHORIZED = 1008,
-
-    /** Web Bluetooth API not supported in this browser */
-    BLUETOOTH_UNSUPPORTED = 1009,
-
-    // -------------------------------------------------------------------------
-    // 2xxx: Protocol Errors
-    // -------------------------------------------------------------------------
-
-    /** Module returned an invalid or unexpected response */
-    INVALID_RESPONSE = 2000,
-
-    /** Failed to write data to the RX characteristic */
-    WRITE_FAILED = 2003,
-
-    // -------------------------------------------------------------------------
-    // 3xxx: Data Validation Errors
-    // -------------------------------------------------------------------------
-
-    /** Data format is invalid (e.g., not valid UTF-8) */
-    INVALID_DATA = 3000,
-
-    /** CRC32 checksum does not match expected value */
-    CRC_MISMATCH = 3001,
-
-    /** Received data length does not match expected length */
-    LENGTH_MISMATCH = 3002,
-
-    // -------------------------------------------------------------------------
-    // 4xxx: Timeout Errors
-    // -------------------------------------------------------------------------
-
-    /** Module profile request timed out */
-    PROFILE_TIMEOUT = 4000,
-
-    /** Data stream timed out before completion */
-    STREAM_TIMEOUT = 4001,
-
-    /** Device scan timed out with no results */
-    SCAN_TIMEOUT = 4002,
-
-    /** Connection attempt timed out */
-    CONNECTION_TIMEOUT = 4003,
-}
-
-/**
- * Custom error class for W4RP operations.
- * Includes error code, message, and optional context for debugging.
- */
-export class W4RPError extends Error {
-    public readonly name = 'W4RPError';
-
-    constructor(
-        /** Standardized error code */
-        public readonly code: W4RPErrorCode,
-        /** Human-readable error message */
-        message: string,
-        /** Additional context for debugging */
-        public readonly context?: Record<string, unknown>
-    ) {
-        super(message);
-        Object.setPrototypeOf(this, W4RPError.prototype);
-    }
-
-    /** Convert to plain object for logging or transmission */
-    toJSON(): Record<string, unknown> {
-        return {
-            name: this.name,
-            code: this.code,
-            message: this.message,
-            context: this.context,
-        };
-    }
-}
-
-// =============================================================================
-// Type Definitions
-// =============================================================================
-
-/**
- * Module profile returned by GET:PROFILE command.
- * Contains device identification and registered capabilities.
- */
-export interface W4RPModuleProfile {
-    module: {
-        /** Unique module identifier (e.g., "W4RP-A1B2C3") */
-        id: string;
-        /** Hardware revision (e.g., "esp32c3-mini-1") */
-        hw?: string;
-        /** Firmware version (e.g., "1.0.0") */
-        fw?: string;
-        /** Human-readable device name */
-        device_name?: string;
-    };
-    /** Registered capabilities (actions the module can perform) */
-    capabilities?: Record<string, W4RPCapability>;
-    /** Runtime configuration */
-    runtime?: {
-        /** Current rules storage mode: "nvs" or "ram" */
-        mode?: string;
-    };
-}
-
-/**
- * A capability represents an action the module can perform.
- * Used by apps to dynamically generate UI controls.
- */
-export interface W4RPCapability {
-    /** Human-readable label (e.g., "Exhaust Valve") */
-    label?: string;
-    /** Category for grouping (e.g., "output", "input", "debug") */
-    category?: string;
-    /** Parameters this capability accepts */
-    params?: W4RPCapabilityParam[];
-}
-
-/**
- * Parameter definition for a capability.
- * Apps use this to render appropriate UI controls.
- */
-export interface W4RPCapabilityParam {
-    /** Parameter identifier */
-    name: string;
-    /** Data type: "int", "float", "bool", "string" */
-    type: string;
-    /** Minimum value (for numeric types) */
-    min?: number;
-    /** Maximum value (for numeric types) */
-    max?: number;
-    /** Human-readable description */
-    description?: string;
-}
-
-/**
- * Debug data received from the module.
- * Used for real-time signal monitoring.
- */
-export interface W4RPDebugData {
-    /** Signal or node identifier */
-    id: string;
-    /** Data type: "signal" or "node" */
-    type: 'signal' | 'node';
-    /** Current value (for signals) */
-    value?: number;
-    /** Active state (for nodes) */
-    active?: boolean;
-}
-
-/**
- * Callback handlers for asynchronous events.
- */
-export interface W4RPBridgeCallbacks {
-    /** Called when module sends a status update JSON */
-    onStatusUpdate?: (json: string) => void;
-    /** Called when debug data is received */
-    onDebugData?: (data: W4RPDebugData) => void;
-    /** Called when connection is lost */
-    onDisconnect?: () => void;
-}
-
-/**
- * Standardized device representation.
- * Used across iOS, Android, and Web platforms.
- */
-export interface W4RPDevice {
-    /** Unique device identifier */
-    id: string;
-    /** Device name (from BLE advertisement) */
-    name: string;
-    /** Signal strength in dBm (0 if not available) */
-    rssi: number;
-}
-
-/**
- * Progress callback for upload operations.
- * @param bytesWritten - Bytes written so far
- * @param totalBytes - Total bytes to write
- */
-export type W4RPProgressCallback = (bytesWritten: number, totalBytes: number) => void;
-
-// =============================================================================
-// Connection State Machine
-// =============================================================================
-
-/**
- * Represents the current state of the BLE connection.
- *
- * State transitions:
- * - DISCONNECTED -> CONNECTING (via connect())
- * - CONNECTING -> DISCOVERING_SERVICES (GATT connected)
- * - DISCOVERING_SERVICES -> READY (characteristics found)
- * - READY -> DISCONNECTING (via disconnect())
- * - DISCONNECTING -> DISCONNECTED (complete)
- * - ANY -> ERROR (on failure)
- */
-export enum W4RPConnectionState {
-    /** Not connected to any device */
-    DISCONNECTED = 'DISCONNECTED',
-
-    /** Scanning for nearby W4RP devices */
-    SCANNING = 'SCANNING',
-
-    /** Initiating GATT connection to a device */
-    CONNECTING = 'CONNECTING',
-
-    /** Connected, discovering services and characteristics */
-    DISCOVERING_SERVICES = 'DISCOVERING_SERVICES',
-
-    /** Fully connected and ready for operations */
-    READY = 'READY',
-
-    /** Disconnection in progress */
-    DISCONNECTING = 'DISCONNECTING',
-
-    /** An error occurred (check lastError for details) */
-    ERROR = 'ERROR',
-}
-
-// =============================================================================
-// Retry Configuration
-// =============================================================================
-
-/**
- * Configuration for exponential backoff retry logic.
- *
- * Example usage:
- * ```typescript
- * const config: W4RPRetryConfig = { maxRetries: 3, baseDelayMs: 1000 };
- * await bridge.connectWithRetry(config);
- * ```
- */
-export interface W4RPRetryConfig {
-    /** Maximum number of retry attempts (0 = no retries, just the initial attempt) */
-    maxRetries: number;
-
-    /** Base delay in milliseconds before first retry (default: 1000) */
-    baseDelayMs: number;
-
-    /** Maximum delay cap in milliseconds (default: 16000) */
-    maxDelayMs: number;
-
-    /** Multiplier for exponential growth (default: 2.0) */
-    multiplier: number;
-}
-
-/** Default retry configuration: 3 retries, 1s base, 16s max, 2x multiplier */
-export const W4RP_DEFAULT_RETRY_CONFIG: W4RPRetryConfig = {
-    maxRetries: 3,
-    baseDelayMs: 1000,
-    maxDelayMs: 16000,
-    multiplier: 2.0,
-};
-
-/**
- * Calculate delay for a given attempt using exponential backoff.
- * @param config Retry configuration
- * @param attempt Attempt number (0-indexed)
- * @returns Delay in milliseconds
- */
-export function calculateRetryDelay(config: W4RPRetryConfig, attempt: number): number {
-    const delay = config.baseDelayMs * Math.pow(config.multiplier, attempt);
-    return Math.min(delay, config.maxDelayMs);
-}
-
-/** Callback type for retry events */
-export type W4RPRetryCallback = (attempt: number, delayMs: number, error: W4RPError) => void;
-
-// =============================================================================
-// Auto-Reconnect Configuration
-// =============================================================================
-
-/**
- * Configuration for automatic reconnection when connection is lost unexpectedly.
- *
- * When enabled, the bridge will attempt to reconnect automatically if the connection
- * is lost (e.g., device goes out of range). The reconnection uses exponential backoff.
- *
- * IMPORTANT: Due to Web Bluetooth security requirements, auto-reconnect may not work
- * in all browsers as reconnection typically requires a new user gesture.
- *
- * @example
- * ```typescript
- * bridge.autoReconnectConfig = { enabled: true, retryConfig: W4RP_DEFAULT_RETRY_CONFIG };
- * bridge.onReconnecting = (attempt) => console.log(`Reconnecting attempt ${attempt}...`);
- * bridge.onReconnected = () => console.log('Reconnected!');
- * bridge.onReconnectFailed = (error) => console.error('Failed:', error);
- * ```
- */
-export interface W4RPAutoReconnectConfig {
-    /** Whether auto-reconnect is enabled (default: false) */
-    enabled: boolean;
-
-    /** Retry configuration for reconnection attempts */
-    retryConfig: W4RPRetryConfig;
-
-    /** Maximum total reconnection attempts across all disconnections (0 = unlimited) */
-    maxLifetimeReconnects: number;
-}
-
-/** Disabled auto-reconnect configuration (default) */
-export const W4RP_DISABLED_AUTO_RECONNECT: W4RPAutoReconnectConfig = {
-    enabled: false,
-    retryConfig: W4RP_DEFAULT_RETRY_CONFIG,
-    maxLifetimeReconnects: 0,
-};
-
-/** Default enabled auto-reconnect configuration: up to 5 reconnect attempts */
-export const W4RP_DEFAULT_AUTO_RECONNECT: W4RPAutoReconnectConfig = {
-    enabled: true,
-    retryConfig: { ...W4RP_DEFAULT_RETRY_CONFIG, maxRetries: 5, baseDelayMs: 2000 },
-    maxLifetimeReconnects: 0,
-};
-
-/** Callback type for reconnect events */
-export type W4RPReconnectCallback = (attempt: number) => void;
-
-// =============================================================================
-// Main Bridge Class
-// =============================================================================
+import {
+    W4RP_UUIDS,
+    W4RPBluetoothStatus,
+    W4RPErrorCode,
+    W4RPError,
+    W4RPModuleProfile,
+    W4RPBridgeCallbacks,
+    W4RPDevice,
+    W4RPProgressCallback,
+    W4RPConnectionState,
+    W4RPRetryConfig,
+    W4RPAutoReconnectConfig,
+    W4RPRetryCallback,
+    W4RPReconnectCallback,
+    W4RP_DEFAULT_RETRY_CONFIG,
+    W4RP_DISABLED_AUTO_RECONNECT,
+    calculateRetryDelay
+} from './BridgeTypes';
 
 /**
  * W4RPBridge - Web Bluetooth client for W4RPBLE modules.
@@ -438,18 +54,34 @@ export class W4RPBridge {
     readonly platform: 'web' | 'ios' | 'android' = 'web';
 
     // BLE State
-    private device: BluetoothDevice | null = null;
+    private _device: BluetoothDevice | null = null;
     private server: BluetoothRemoteGATTServer | null = null;
     private rxCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
     private txCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
     private statusCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
 
     // Device Cache (for scan -> connect flow)
-    private discoveredDevices: Map<string, BluetoothDevice> = new Map();
+    private discoveredDevicesMap: Map<string, BluetoothDevice> = new Map();
 
     // Connection State
     private _connectionState: W4RPConnectionState = W4RPConnectionState.DISCONNECTED;
+
+    /** Internal helper to update state and trigger callbacks */
+    private updateConnectionState(newState: W4RPConnectionState): void {
+        if (this._connectionState !== newState) {
+            this._connectionState = newState;
+            this.callbacks.onConnectionStateChanged?.(newState);
+            this.onConnectionStateChanged?.(newState);
+        }
+    }
+
+    /** Called when connection state changes (direct property assignment) */
+    onConnectionStateChanged: ((state: W4RPConnectionState) => void) | null = null;
+    /** Called when Bluetooth status changes (direct property assignment) */
+    onBluetoothStatusChanged: ((status: W4RPBluetoothStatus) => void) | null = null;
+
     private _lastError: W4RPError | null = null;
+    private _bluetoothStatus: W4RPBluetoothStatus = W4RPBluetoothStatus.UNKNOWN;
 
     // Stream State (for receiving large payloads)
     private streamActive = false;
@@ -472,6 +104,9 @@ export class W4RPBridge {
     // Configuration
     // ---------------------------------------------------------------------------
 
+    /** UUID configuration (default: W4RP standard UUIDs) */
+    uuids: typeof W4RP_UUIDS = { ...W4RP_UUIDS };
+
     /** Auto-reconnect configuration (default: disabled) */
     autoReconnectConfig: W4RPAutoReconnectConfig = W4RP_DISABLED_AUTO_RECONNECT;
 
@@ -485,6 +120,14 @@ export class W4RPBridge {
     onReconnected: (() => void) | null = null;
     /** Called when auto-reconnect fails after all attempts */
     onReconnectFailed: ((error: W4RPError) => void) | null = null;
+    /** Called when device(s) are discovered during scanning */
+    onDeviceDiscovered: ((devices: W4RPDevice[]) => void) | null = null;
+    /** Called when module sends a status update */
+    onStatusUpdate: ((json: string) => void) | null = null;
+    /** Called when debug data is received */
+    onDebugData: ((data: import('./BridgeTypes').W4RPDebugData) => void) | null = null;
+    /** Called when an error occurs */
+    onError: ((error: W4RPError) => void) | null = null;
 
     // ---------------------------------------------------------------------------
     // Public Getters
@@ -505,9 +148,28 @@ export class W4RPBridge {
         return this._connectionState === W4RPConnectionState.READY;
     }
 
+    /** Whether the bridge is currently scanning for devices */
+    get isScanning(): boolean {
+        return this._connectionState === W4RPConnectionState.SCANNING;
+    }
+
+    /** List of discovered devices (populated during scan) */
+    get discoveredDevices(): W4RPDevice[] {
+        return Array.from(this.discoveredDevicesMap.values()).map(d => ({
+            id: d.id,
+            name: d.name || 'Unknown',
+            rssi: 0
+        }));
+    }
+
     /** Name of the connected device, or null if not connected */
     get connectedDeviceName(): string | null {
         return this.device?.name ?? null;
+    }
+
+    /** Current Bluetooth adapter status */
+    get bluetoothStatus(): W4RPBluetoothStatus {
+        return this._bluetoothStatus;
     }
 
     // ---------------------------------------------------------------------------
@@ -557,7 +219,7 @@ export class W4RPBridge {
             );
         }
 
-        this._connectionState = W4RPConnectionState.SCANNING;
+        this.updateConnectionState(W4RPConnectionState.SCANNING);
         this._lastError = null;
 
         try {
@@ -567,24 +229,29 @@ export class W4RPBridge {
             });
 
             if (!device) {
-                this._connectionState = W4RPConnectionState.DISCONNECTED;
+                this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
                 throw new W4RPError(W4RPErrorCode.DEVICE_NOT_FOUND, 'No device was selected');
             }
 
             // Cache the device for connect()
-            this.discoveredDevices.set(device.id, device);
+            this.discoveredDevicesMap.set(device.id, device);
 
-            this._connectionState = W4RPConnectionState.DISCONNECTED;
-
-            // Return standardized device format matching Swift/Kotlin
-            return [{
+            // Notify device discovered
+            const devices: W4RPDevice[] = [{
                 id: device.id,
                 name: device.name || 'Unknown W4RP Device',
-                rssi: 0 // Not available from Web Bluetooth picker
+                rssi: 0
             }];
+            this.callbacks.onDeviceDiscovered?.(devices);
+            this.onDeviceDiscovered?.(devices);
+
+            this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
+
+            // Return standardized device format matching Swift/Kotlin
+            return devices;
 
         } catch (error) {
-            this._connectionState = W4RPConnectionState.DISCONNECTED;
+            this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
 
             if (error instanceof W4RPError) {
                 this._lastError = error;
@@ -610,7 +277,7 @@ export class W4RPBridge {
      */
     stopScan(): void {
         if (this._connectionState === W4RPConnectionState.SCANNING) {
-            this._connectionState = W4RPConnectionState.DISCONNECTED;
+            this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
         }
     }
 
@@ -624,7 +291,7 @@ export class W4RPBridge {
      */
     async connect(deviceId: string): Promise<void> {
         // Look up the device from cache
-        const device = this.discoveredDevices.get(deviceId);
+        const device = this.discoveredDevicesMap.get(deviceId);
         if (!device) {
             throw new W4RPError(
                 W4RPErrorCode.DEVICE_NOT_FOUND,
@@ -636,24 +303,24 @@ export class W4RPBridge {
             throw new W4RPError(W4RPErrorCode.ALREADY_CONNECTED, 'Already connected to a device');
         }
 
-        this._connectionState = W4RPConnectionState.CONNECTING;
+        this.updateConnectionState(W4RPConnectionState.CONNECTING);
         this._lastError = null;
-        this.device = device;
+        this._device = device;
         this.wasIntentionalDisconnect = false;
 
         try {
             // Listen for unexpected disconnection
-            this.device.addEventListener('gattserverdisconnected', () => {
+            this._device.addEventListener('gattserverdisconnected', () => {
                 this.handleDisconnect();
             });
 
             // Connect to GATT server
-            this.server = await this.device.gatt?.connect();
+            this.server = await this._device.gatt?.connect();
             if (!this.server) {
                 throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Failed to connect to GATT server');
             }
 
-            this._connectionState = W4RPConnectionState.DISCOVERING_SERVICES;
+            this.updateConnectionState(W4RPConnectionState.DISCOVERING_SERVICES);
 
             // Discover service
             const service = await this.server.getPrimaryService(W4RP_UUIDS.SERVICE);
@@ -679,14 +346,15 @@ export class W4RPBridge {
                 if (value) {
                     const text = new TextDecoder().decode(value);
                     this.callbacks.onStatusUpdate?.(text);
+                    this.onStatusUpdate?.(text);
                 }
             });
 
-            this._connectionState = W4RPConnectionState.READY;
+            this.updateConnectionState(W4RPConnectionState.READY);
             this._lastError = null;
 
         } catch (error) {
-            this._connectionState = W4RPConnectionState.ERROR;
+            this.updateConnectionState(W4RPConnectionState.ERROR);
 
             if (error instanceof W4RPError) {
                 this._lastError = error;
@@ -758,7 +426,7 @@ export class W4RPBridge {
                     onRetry?.(attempt + 1, delayMs, error);
 
                     // Ensure we're in a clean state before retrying
-                    this._connectionState = W4RPConnectionState.DISCONNECTED;
+                    this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
 
                     await this.delay(delayMs);
                 } else {
@@ -782,55 +450,61 @@ export class W4RPBridge {
      */
     disconnect(): void {
         this.wasIntentionalDisconnect = true;
-        this._connectionState = W4RPConnectionState.DISCONNECTING;
+        this.updateConnectionState(W4RPConnectionState.DISCONNECTING);
         this.server?.disconnect();
         this.handleDisconnect();
     }
 
     /**
-     * Fetch the module profile.
-     * Returns device identification and registered capabilities.
+     * Fetch raw WBP profile binary from the module.
      * 
-     * @returns Module profile object
+     * Returns raw bytes - UI is responsible for parsing with WBPParser.
+     * 
+     * @returns Raw WBP binary data
      * @throws {W4RPError} If not connected or request times out
      */
-    async getProfile(): Promise<W4RPModuleProfile> {
+    async getProfile(): Promise<Uint8Array> {
         this.ensureConnected();
-
-        const data = await this.streamRequest('GET:PROFILE');
-        const json = new TextDecoder().decode(data);
-
-        try {
-            return JSON.parse(json) as W4RPModuleProfile;
-        } catch {
-            throw new W4RPError(W4RPErrorCode.INVALID_DATA, 'Failed to parse profile JSON');
-        }
+        return this.streamRequest('GET:PROFILE');
     }
 
     /**
-     * Send rules to the module.
+     * Fetch raw WBP rules binary from the module.
      * 
-     * @param json - JSON string containing the ruleset
+     * Returns raw bytes - UI is responsible for parsing with WBPParser.
+     * 
+     * @returns Raw WBP binary data (or throws if no rules loaded)
+     * @throws {W4RPError} If not connected or request times out
+     */
+    async getRules(): Promise<Uint8Array> {
+        this.ensureConnected();
+        return this.streamRequest('GET:RULES');
+    }
+
+    /**
+     * Send compiled WBP rules binary to the module.
+     * 
+     * @param binary - Compiled WBP binary ruleset (from WBPCompiler)
      * @param persistent - If true, rules are saved to NVS (survive reboot)
      * @param onProgress - Optional callback reporting upload progress
      * @throws {W4RPError} If not connected or write fails
      */
     async setRules(
-        json: string,
+        binary: Uint8Array,
         persistent: boolean,
         onProgress?: W4RPProgressCallback
     ): Promise<void> {
         this.ensureConnected();
 
-        const data = new TextEncoder().encode(json);
-        const crc = this.crc32(data);
+        const crc = this.crc32(binary);
         const mode = persistent ? 'NVS' : 'RAM';
-        const header = `SET:RULES:${mode}:${data.length}:${crc}`;
+        const header = `SET:RULES:${mode}:${binary.length}:${crc}`;
 
         await this.write(new TextEncoder().encode(header));
-        await this.sendChunked(data, 180, onProgress);
+        await this.sendChunked(binary, 180, onProgress);
         await this.write(new TextEncoder().encode('END'));
     }
+
 
     /**
      * Start a Delta OTA firmware update.
@@ -846,7 +520,7 @@ export class W4RPBridge {
         this.ensureConnected();
 
         const crc = this.crc32(patchData);
-        const cmd = `OTA:BEGIN:DELTA:${patchData.length}:${crc.toString(16).toUpperCase()}`;
+        const cmd = `OTA:DELTA:${patchData.length}:${crc.toString(16).toUpperCase()}`;
 
         await this.write(new TextEncoder().encode(cmd));
         await this.delay(200); // Allow ESP32 to prepare
@@ -866,6 +540,98 @@ export class W4RPBridge {
         await this.write(new TextEncoder().encode(cmd));
     }
 
+    /**
+     * Set specific signals to watch in debug mode.
+     * Sends comma-separated signal specs to firmware.
+     * 
+     * @param signals - Array of signal objects with can_id, start, len/length, be/big_endian, factor, offset
+     */
+    async watchDebugSignals(signals: any[]): Promise<void> {
+        this.ensureConnected();
+
+        // Build comma-separated specs: canId:start:len:be:factor:offset
+        const specs = signals.map(s => {
+            const can_id = s.can_id;
+            const start = s.start ?? s.start_bit ?? 0;
+            const len = s.length ?? s.len ?? s.bit_length ?? 8;
+            const be = (s.big_endian ?? s.be ?? false) ? 1 : 0;
+            const factor = s.factor ?? 1;
+            const offset = s.offset ?? 0;
+            return `${can_id}:${start}:${len}:${be}:${factor}:${offset}`;
+        });
+
+        const payload = specs.join(',');
+        const data = new TextEncoder().encode(payload);
+        const crc = this.crc32(data);
+        const header = `DEBUG:WATCH:${data.length}:${crc}`;
+
+        await this.write(new TextEncoder().encode(header));
+        await this.delay(50); // Allow firmware to prepare for stream
+        await this.sendChunked(data);
+        await this.write(new TextEncoder().encode('END'));
+    }
+
+    /**
+     * Stop an ongoing OTA update.
+     * The module remains on current firmware; no rollback occurs.
+     */
+    stopOTA(): void {
+        // OTA cancellation - sets internal flag
+        // The actual OTA loop should check this flag
+        this._otaCancelled = true;
+    }
+
+    /** Internal flag for OTA cancellation */
+    private _otaCancelled = false;
+
+    /**
+     * Information about the currently connected device.
+     * Returns null if not connected.
+     */
+    get connectedDevice(): W4RPDevice | null {
+        if (!this.isConnected || !this._device) {
+            return null;
+        }
+        return {
+            id: this._device.id,
+            name: this._device.name || 'Unknown',
+            rssi: 0 // Not available via Web Bluetooth after connection
+        };
+    }
+
+    /**
+     * Unified API: The device object - null if not connected, populated if connected.
+     * This is the preferred property for cross-platform consistency (matches Swift/Kotlin).
+     */
+    get device(): W4RPDevice | null {
+        return this.connectedDevice;
+    }
+
+    /**
+     * Get detailed information about the current connection.
+     * 
+     * @returns Connection info object or null if not connected
+     */
+    getConnectionInfo(): { deviceId: string; deviceName: string; rssi: number; isConnected: boolean } | null {
+        if (!this.isConnected || !this.device) {
+            return null;
+        }
+        return {
+            deviceId: this.device.id,
+            deviceName: this.device.name || 'Unknown',
+            rssi: 0, // Not available via Web Bluetooth
+            isConnected: true
+        };
+    }
+
+    /**
+     * Notify that the application is ready (used for splash screen handling in native wrappers).
+     * In web mode, this is a no-op or logging operation.
+     */
+    notifyAppReady(): void {
+        console.log("App Ready (Web Mode)");
+    }
+
     // ---------------------------------------------------------------------------
     // Private Methods
     // ---------------------------------------------------------------------------
@@ -875,6 +641,14 @@ export class W4RPBridge {
         if (!this.isConnected || !this.rxCharacteristic) {
             throw new W4RPError(W4RPErrorCode.NOT_CONNECTED, 'Not connected to a device');
         }
+    }
+
+    /** Centralized error handler - mirrors Swift/Kotlin pattern */
+    private handleError(error: W4RPError): void {
+        this._lastError = error;
+        this.updateConnectionState(W4RPConnectionState.ERROR);
+        this.callbacks.onError?.(error);
+        this.onError?.(error);
     }
 
     /** Write data to RX characteristic */
@@ -955,6 +729,26 @@ export class W4RPBridge {
             return;
         }
 
+        // Error responses from firmware (ERR:LEN_MISMATCH, ERR:CRC_FAIL, ERR:CAP_UNKNOWN:*, etc.)
+        if (text.startsWith('ERR:')) {
+            const errorType = text.substring(4);
+            const error = new W4RPError(W4RPErrorCode.INVALID_RESPONSE, `Firmware error: ${errorType}`);
+            this.handleError(error);
+
+            // If we have an active stream, fail it
+            if (this.streamActive || this.streamResolve) {
+                this.finishStream(error);
+            }
+            return;
+        }
+
+        // OTA responses
+        if (text.startsWith('OTA:')) {
+            // OTA:READY, OTA:SUCCESS, OTA:ERROR, OTA:CANCELLED handled here if needed
+            // For now, these are informational - could add callback
+            return;
+        }
+
         // Accumulate stream data
         if (this.streamActive) {
             const newBuffer = new Uint8Array(this.streamBuffer.length + data.length);
@@ -970,21 +764,30 @@ export class W4RPBridge {
         if (parts.length < 4) return;
 
         const type = parts[1];
-        const id = parts[2];
-        const value = parts[3];
 
         if (type === 'S') {
-            this.callbacks.onDebugData?.({
-                id,
-                type: 'signal',
-                value: parseFloat(value),
-            });
+            // Signal format: D:S:can_id:start:len:be:factor:offset:value
+            // Signal key = parts[2] through parts[length-2]
+            // Value = parts[length-1]
+            const signalKey = parts.slice(2, -1).join(':');
+            const value = parseFloat(parts[parts.length - 1]);
+            const debugData = {
+                id: signalKey,
+                type: 'signal' as const,
+                value,
+            };
+            this.callbacks.onDebugData?.(debugData);
+            this.onDebugData?.(debugData);
         } else if (type === 'N') {
-            this.callbacks.onDebugData?.({
+            const id = parts[2];
+            const value = parts[3];
+            const debugData = {
                 id,
-                type: 'node',
+                type: 'node' as const,
                 active: value === '1',
-            });
+            };
+            this.callbacks.onDebugData?.(debugData);
+            this.onDebugData?.(debugData);
         }
     }
 
@@ -1035,9 +838,9 @@ export class W4RPBridge {
     /** Handle disconnection */
     private handleDisconnect(): void {
         const previousState = this._connectionState;
-        const device = this.device;
+        const device = this._device;
 
-        this._connectionState = W4RPConnectionState.DISCONNECTED;
+        this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
         this.server = null;
         this.rxCharacteristic = null;
         this.txCharacteristic = null;
@@ -1083,14 +886,14 @@ export class W4RPBridge {
                     throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Device GATT not available');
                 }
 
-                this._connectionState = W4RPConnectionState.CONNECTING;
+                this.updateConnectionState(W4RPConnectionState.CONNECTING);
                 this.server = await device.gatt.connect();
 
                 if (!this.server) {
                     throw new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Failed to connect to GATT server');
                 }
 
-                this._connectionState = W4RPConnectionState.DISCOVERING_SERVICES;
+                this.updateConnectionState(W4RPConnectionState.DISCOVERING_SERVICES);
                 const service = await this.server.getPrimaryService(W4RP_UUIDS.SERVICE);
                 this.rxCharacteristic = await service.getCharacteristic(W4RP_UUIDS.RX);
                 this.txCharacteristic = await service.getCharacteristic(W4RP_UUIDS.TX);
@@ -1114,7 +917,7 @@ export class W4RPBridge {
                     }
                 });
 
-                this._connectionState = W4RPConnectionState.READY;
+                this.updateConnectionState(W4RPConnectionState.READY);
                 this._lastError = null;
                 this.isAutoReconnecting = false;
                 this.onReconnected?.();
@@ -1131,7 +934,7 @@ export class W4RPBridge {
             }
         }
 
-        this._connectionState = W4RPConnectionState.DISCONNECTED;
+        this.updateConnectionState(W4RPConnectionState.DISCONNECTED);
         this.isAutoReconnecting = false;
         this.onReconnectFailed?.(lastReconnectError ?? new W4RPError(W4RPErrorCode.CONNECTION_FAILED, 'Auto-reconnect failed'));
     }
@@ -1155,47 +958,60 @@ export class W4RPBridge {
         }
         return (crc ^ 0xffffffff) >>> 0;
     }
-}
+    private async checkBluetoothStatus(): Promise<void> {
+        let status = W4RPBluetoothStatus.UNKNOWN;
 
-// =============================================================================
-// Global Bridge Interface & Auto-Install
-// =============================================================================
-
-/**
- * Global window declaration for W4RPBridge.
- * 
- * On all platforms, consumers should use: window.W4RPBridge
- * - iOS: Native Swift bridge is injected by WKWebView
- * - Android: Native Kotlin bridge is injected by WebView
- * - Web: This TypeScript implementation auto-installs itself
- */
-declare global {
-    interface Window {
-        /** Unified W4RP Bridge - available on all platforms */
-        W4RPBridge: W4RPBridge;
-    }
-}
-
-/**
- * Auto-install W4RPBridge on window if:
- * 1. We're in a browser environment
- * 2. No native bridge has been injected (iOS/Android)
- * 3. Web Bluetooth is supported
- * 
- * This ensures window.W4RPBridge is ALWAYS available, making the API
- * truly unified across iOS, Android, and Web.
- */
-if (typeof window !== 'undefined') {
-    // Only auto-install if no native bridge exists
-    if (!window.W4RPBridge) {
-        // Check Web Bluetooth support
-        if ('bluetooth' in navigator) {
-            window.W4RPBridge = new W4RPBridge();
-            console.log('[W4RP] Bridge auto-installed (platform: web)');
-        } else {
-            console.warn('[W4RP] Web Bluetooth not supported in this browser');
+        try {
+            if (typeof navigator === 'undefined' || !navigator.bluetooth) {
+                status = W4RPBluetoothStatus.UNSUPPORTED;
+            } else if (typeof window !== 'undefined' && !window.isSecureContext) {
+                status = W4RPBluetoothStatus.UNAUTHORIZED;
+            } else {
+                const available = await navigator.bluetooth.getAvailability();
+                status = available ? W4RPBluetoothStatus.READY : W4RPBluetoothStatus.POWERED_OFF;
+            }
+        } catch (error: any) {
+            if (error.name === 'NotSupportedError') {
+                status = W4RPBluetoothStatus.UNSUPPORTED;
+            } else if (error.name === 'SecurityError') {
+                status = W4RPBluetoothStatus.UNAUTHORIZED;
+            } else {
+                status = W4RPBluetoothStatus.UNKNOWN;
+            }
         }
-    } else {
-        console.log(`[W4RP] Native bridge detected (platform: ${window.W4RPBridge.platform})`);
+
+        this.updateBluetoothStatus(status);
+    }
+
+    private updateBluetoothStatus(newStatus: W4RPBluetoothStatus): void {
+        if (this._bluetoothStatus !== newStatus) {
+            this._bluetoothStatus = newStatus;
+            this.callbacks.onBluetoothStatusChanged?.(newStatus);
+            this.onBluetoothStatusChanged?.(newStatus);
+        }
+    }
+
+    /**
+     * Start monitoring Bluetooth availability.
+     * Called automatically by constructor if platform is web.
+     */
+    private initStatusMonitoring(): void {
+        if (typeof navigator !== 'undefined' && navigator.bluetooth) {
+            this.checkBluetoothStatus();
+            navigator.bluetooth.addEventListener('availabilitychanged', (event: Event) => {
+                // event.value is boolean in Web Bluetooth spec
+                const available = (event as any).value;
+                const status = available ? W4RPBluetoothStatus.READY : W4RPBluetoothStatus.POWERED_OFF;
+                this.updateBluetoothStatus(status);
+            });
+        }
+    }
+
+    constructor() {
+        if (typeof window !== 'undefined') {
+            // Auto install on window for easy access
+            (window as any).W4RPBridge = this;
+            this.initStatusMonitoring();
+        }
     }
 }

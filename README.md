@@ -1,7 +1,7 @@
 # W4RP-BRIDGE
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.2.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)]()
 
 **Official client libraries for W4RPBLE firmware modules.**
 
@@ -11,13 +11,30 @@ These client libraries are designed to communicate with devices running the [W4R
 
 **ESP32 Firmware Library:** [https://github.com/W4RPCAN/W4RP-BLE](https://github.com/W4RPCAN/W4RP-BLE)
 
+## Architecture
+
+The bridge acts as a **dumb pipe** - a pure binary transport layer. All parsing and compiling logic lives in the UI:
+
+```
+UI (TypeScript)                Bridge                    Firmware
+───────────────                ──────                    ────────
+WBPCompiler (JSON→bin) ──────► pass bytes ─────────►    Binary
+WBPParser (bin→JSON)  ◄─────── pass bytes ◄──────────   Binary
+```
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **WBPCompiler** | UI/SDK | Compiles JSON rules → WBP binary |
+| **WBPParser** | UI/SDK | Parses WBP binary → JSON |
+| **Bridge** | iOS/Android/Web | Just moves bytes |
+
 ## Implementations
 
 | Platform | File | Runtime |
 |---|---|---|
-| **iOS / macOS** | [`Swift/W4RPBridge.swift`](Swift/W4RPBridge.swift) | iOS 15+, macOS 12+ (async/await) |
-| **Android** | [`Kotlin/W4RPBridge.kt`](Kotlin/W4RPBridge.kt) | API 21+ (Lollipop) |
-| **Web** | [`WebBluetooth/W4RPBridge.ts`](WebBluetooth/W4RPBridge.ts) | Chrome 56+, Edge 79+ |
+| **iOS / macOS** | [`Swift/BridgeBLE.swift`](Swift/BridgeBLE.swift) | iOS 15+, macOS 12+ (async/await) |
+| **Android** | [`Kotlin/BridgeBLE.kt`](Kotlin/BridgeBLE.kt) | API 21+ (Lollipop) |
+| **Web** | [`WebBluetooth/BridgeBLE.ts`](WebBluetooth/BridgeBLE.ts) | Chrome 56+, Edge 79+ |
 
 ---
 
@@ -45,8 +62,6 @@ The middle octets encode "W4RP" in ASCII hexadecimal:
 | R | 82 | 0x52 |
 | P | 80 | 0x50 |
 
-This provides a recognizable namespace (`W4RP`) while remaining fully compliant with the Bluetooth SIG UUID specification. The `fff0`-`fff3` prefix uses the reserved vendor-specific range.
-
 ### Characteristics
 
 | UUID Suffix | Name | Properties | Description |
@@ -61,13 +76,22 @@ Commands are UTF-8 strings written to the RX characteristic.
 
 | Command | Description |
 |---------|-------------|
-| `GET:PROFILE` | Request module profile JSON |
-| `SET:RULES:NVS:LEN:CRC` | Upload and save rules (persistent, survives reboot) |
-| `SET:RULES:RAM:LEN:CRC` | Upload and test rules (volatile, lost on reboot) |
+| `GET:PROFILE` | Request WBP binary profile |
+| `SET:RULES:NVS:LEN:CRC` | Upload WBP binary rules (persistent) |
+| `SET:RULES:RAM:LEN:CRC` | Upload WBP binary rules (volatile) |
 | `DEBUG:START` | Enable debug streaming |
 | `DEBUG:STOP` | Disable debug streaming |
 | `DEBUG:WATCH:LEN:CRC` | Set watched signals for debugging |
 | `OTA:BEGIN:DELTA:SIZE:CRC` | Start Delta OTA firmware update |
+
+### WBP Binary Protocol (v2)
+
+All profile and rules data uses the **WBP binary format**:
+
+- `GET:PROFILE` returns raw WBP binary (not JSON)
+- `SET:RULES` expects compiled WBP binary (not JSON)
+
+The UI is responsible for parsing/compiling using `WBPParser` and `WBPCompiler`.
 
 ### Streaming Protocol
 
@@ -177,11 +201,9 @@ All implementations use standardized error codes organized by category:
 
 ## Usage Examples
 
-### Swift (iOS) - Async/Await
+### Swift (iOS) - Dumb Pipe
 
 ```swift
-import W4RPBridge
-
 let bridge = W4RPBridge()
 
 Task {
@@ -189,20 +211,24 @@ Task {
         let devices = try await bridge.scan()
         guard let device = devices.first else { return }
         try await bridge.connect(to: device)
-        let profile = try await bridge.getProfile()
-        print("Module: \(profile.module.id)")
+        
+        // getProfile returns raw Data - parse in UI
+        let profileData = try await bridge.getProfile()
+        let base64 = profileData.base64EncodedString()
+        // Send to JS: WBPParser.parse(atob(base64))
+        
+        // setRules expects compiled binary - compile in UI
+        let binary: Data = ... // from WBPCompiler
+        try await bridge.setRules(binary: binary, persistent: true)
     } catch let error as W4RPError {
         print("Error \(error.code.rawValue): \(error.message)")
     }
 }
 ```
 
-### Kotlin (Android) - Suspend Functions
+### Kotlin (Android) - Dumb Pipe
 
 ```kotlin
-import com.w4rp.bridge.W4RPBridge
-import kotlinx.coroutines.launch
-
 val bridge = W4RPBridge(context)
 
 lifecycleScope.launch {
@@ -210,32 +236,42 @@ lifecycleScope.launch {
         val devices = bridge.scan()
         val device = devices.firstOrNull() ?: return@launch
         bridge.connect(device)
-        val profile = bridge.getProfile()
-        Log.d("W4RP", "Profile: $profile")
-    } catch (e: W4RPException) {
-        Log.e("W4RP", "Error ${e.errorCode.code}: ${e.message}")
+        
+        // getProfile returns raw ByteArray - parse in UI
+        val profileData = bridge.getProfile()
+        val base64 = Base64.encodeToString(profileData, Base64.NO_WRAP)
+        // Send to JS: WBPParser.parse(atob(base64))
+        
+        // setRules expects compiled binary - compile in UI
+        val binary: ByteArray = ... // from WBPCompiler
+        bridge.setRules(binary, persistent = true)
+    } catch (e: W4RPError) {
+        Log.e("W4RP", "Error ${e.code.code}: ${e.message}")
     }
 }
 ```
 
-### TypeScript (Web)
+### TypeScript (Web) - Dumb Pipe
 
 ```typescript
-import { W4RPBridge, W4RPError } from './W4RPBridge';
+import { W4RPBridge } from './BridgeBLE';
+import { WBPParser, WBPCompiler } from './wbp'; // Your UI library
 
 const bridge = new W4RPBridge();
 
-// Must be triggered by user gesture
 async function connect() {
-    try {
-        await bridge.connect();
-        const profile = await bridge.getProfile();
-        console.log('Module:', profile.module.id);
-    } catch (error) {
-        if (error instanceof W4RPError) {
-            console.error(`Error ${error.code}: ${error.message}`);
-        }
-    }
+    const devices = await bridge.scan();
+    await bridge.connect(devices[0].id);
+    
+    // getProfile returns Uint8Array - parse locally
+    const profileBinary = await bridge.getProfile();
+    const profile = WBPParser.parse(profileBinary);
+    console.log('Module:', profile.moduleId);
+    
+    // setRules expects Uint8Array - compile locally
+    const rules = { signals: [...], nodes: [...] };
+    const binary = WBPCompiler.compile(rules);
+    await bridge.setRules(binary, true);
 }
 ```
 
